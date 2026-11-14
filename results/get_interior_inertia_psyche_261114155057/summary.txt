@@ -1,0 +1,65 @@
+16 Psyche moments of inertia: Ermakov (2026, PSJ 7:170) vs get_interior_inertia_psyche.py
+Shape Psyche-Shepard2021.sh (Zenodo 10.5281/zenodo.12522382), degree 10; quadrature 64 x 128; R0 = 109 km; mean density 4172 kg/m^3
+V = 5.78776e+15 m^3, R_v = 111.380 km, centre-of-mass offset 1.811 km
+
+1. Homogeneous body (paper Table 1, Shepard et al. 2021 row)
+  Quantity                                           Ermakov (2026)            This script
+  A_bar                                                      0.3566       0.3575 (+0.24 %)
+  B_bar                                                      0.4430       0.4442 (+0.28 %)
+  C_bar                                                      0.5524       0.5547 (+0.42 %)
+  J2                                                         0.1526       0.1539 (+0.82 %)
+  C22                                                        0.0216       0.0217 (+0.41 %)
+  H                                                          0.2762       0.2774 (+0.42 %)
+  I_bar = J2 (1/H - 2/3)                                     0.4508                 0.4521
+
+2. Two-layer endmembers (paper Sec. 4.1, Fig. 2)
+  Quantity                                           Ermakov (2026)            This script
+  r_min, core exposure onset [km]                              79.0                   78.8
+  (A) min H, rho1 >= 2000                                    0.1900                 0.1907
+  (A) min I_bar, rho2 <= 12000                               0.3000                 0.2970
+  (A) min I_bar, rho2 <= 8000                                     -                 0.3298
+  (A) min I_bar at r2 [km], rho2 [kg/m^3]                         -            67.0, 11901
+  (B) H change vs homogeneous                            unaffected            max 1.4e-05
+  (B) J2                                              < homogeneous              >= 0.1032
+  H range, A, B, C at 75-110 % (C largest)              0.05 - 0.51          0.047 - 0.507
+
+3. MCMC (a): theta = (A_bar, B_bar, C_bar), prior 75-110 % of homogeneous
+   data J2, C22 (sigma/value 0.004 %) + H; truth = two-layer TRUTH; 32 walkers x 6000 steps
+  sigma_H/H                I_bar (16-50-84 %)   sigma_I MCMC     Eq. 13
+  0.5 %                0.3940 +0.0025 -0.0024         0.0024     0.0024
+  1.0 %                0.3986 +0.0050 -0.0048         0.0050     0.0047
+  1.8 %                0.4064 +0.0091 -0.0090         0.0091     0.0085
+  2.6 %                0.4145 +0.0137 -0.0128         0.0134     0.0123
+  5.0 %                0.4359 +0.0215 -0.0242         0.0215     0.0237
+  10.0 %               0.4413 +0.0208 -0.0322         0.0258     0.0474
+  no H                 0.4071 +0.0424 -0.0413         0.0356          -
+  prior only: I_bar 0.4202 +0.0290 -0.0307, sigma 0.0281
+  Quantity                                           Ermakov (2026)            This script
+  sigma_H/H for sigma_I = 0.01, C_bar 75 % hom                2.6 %        2.40 % (Eq. 13)
+  sigma_H/H for sigma_I = 0.01, C_bar homogeneous              1.8 %        1.80 % (Eq. 13)
+  sigma_H/H for sigma_I = 0.01, C_bar 110 % hom                   -        1.64 % (Eq. 13)
+  sigma_H/H for sigma_I = 0.01, truth C_bar                       -   2.11 % / 1.96 % MCMC
+
+4. MCMC (b): theta = (r2 [km], rho2 [kg/m^3], w); prior [10.0, 4172.0, 0.0] - [110.0, 8000.0, 1.0], rho1 >= 2000
+   data J2, C22 (sigma 0.100 %, model floor 0.10 %), H (sigma 1.8 %); 32 walkers x 30000 steps, burn-in 3152, thin 230, tau max 630.5
+                    truth             posterior (16-50-84 %)                 prior (16-50-84 %)
+  r2              70.0000            74.6183 +7.4598 -5.9370          50.8360 +28.2213 -27.8061
+  rho2          7000.0000      6219.3427 +885.0026 -709.6672    5923.9711 +1418.4733 -1253.2424
+  w                0.5000             0.2996 +0.1477 -0.0830             0.5014 +0.3336 -0.3407
+  I_bar            0.3894             0.3973 +0.0084 -0.0075             0.4408 +0.0103 -0.0378
+  C_bar            0.4740             0.4819 +0.0084 -0.0075             0.5404 +0.0129 -0.0505
+  H                0.2677             0.2631 +0.0042 -0.0045             0.2769 +0.0005 -0.0083
+  J2               0.1269             0.1268 +0.0001 -0.0001             0.1494 +0.0040 -0.0183
+  rho1          3253.8553        3316.7856 +27.9627 -46.5638      4034.4232 +126.7762 -727.7304
+  r_c             69.7027            74.3345 +7.4674 -5.9306          50.7644 +28.0506 -27.7779
+
+5. Precession (paper Eq. 1, Table 3), homogeneous body
+   pole RA 36.0, Dec 6.0 deg; orbit a 2.9234 AU, e 0.134, i 3.0969 deg, node 150.032 deg (approximate)
+  Quantity                                           Ermakov (2026)            This script
+  obliquity [deg]                                93.2 - 99.4 (10 My)                  95.03
+  precession period, present obliquity [My]                       -                   1.39
+  precession period, mean obliquity 96.3 deg [My]               1.10                   1.11
+  d alpha / dt [mas/yr]                                       886.9                  888.0
+  d delta / dt [mas/yr]                                       281.0                  281.4
+  pole drift rate, MCMC (b) H [mas/yr]                            -         879.2 +/- 14.2
+   pole drift rate is proportional to H (paper Eq. 12): sigma_H / H = 1.8 % <-> 16.7 mas/yr on 926.9 mas/yr
