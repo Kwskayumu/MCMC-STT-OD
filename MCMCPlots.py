@@ -19,7 +19,7 @@ Sections:
                            rtn_corner_map), all-in-one plot_mcmc_diagnostics
     GMM PROPAGATION        figures of GMM.GMM.propagate_stm results
     STT BENCHMARK          STT surrogate vs full nonlinear likelihood (J1_benchmark_STTs.py)
-    QUICK-LOOK (legacy)    the original MCMCModel.plot_* figures (Tests/, Extra/ scripts)
+    QUICK-LOOK (legacy)    the original MCMCModel.plot_* figures (tests/, extra/ scripts)
 
 The quick-look rcParams below are applied on import (as MCMC.py always did); configure()
 replaces them with the journal style.
@@ -3098,7 +3098,7 @@ def plot_stt_benchmark(bench, mcmc_order=None, name="fig_stt_benchmark"):
 # ============================================================
 # QUICK-LOOK (legacy) MCMC figures
 # ============================================================
-# The original MCMCModel.plot_* figures (Tests/ and Extra/ scripts call them through the
+# The original MCMCModel.plot_* figures (tests/ and extra/ scripts call them through the
 # MCMCModel methods). They use LEGACY_STYLE and are not part of the journal figure set.
 
 

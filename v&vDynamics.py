@@ -326,7 +326,7 @@ if __name__ == "__main__":
     # --------------------------
     # USER SETTINGS (edit these)
     # --------------------------
-    KERNEL_ROOT = Path("./kernels")
+    KERNEL_ROOT = Path("./data/kernels")
     SC_NAME = "-64000401"
     CENTER = "BENNU"
     FRAME_I = "J2000"

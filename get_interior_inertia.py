@@ -75,7 +75,7 @@ HERE = Path(__file__).resolve().parent
 # ============================================================
 
 # --- Outer shape ---
-SHAPE_OBJ = HERE / "ObjFiles" / "Bennu2019.obj"  # body-fixed shape model
+SHAPE_OBJ = HERE / "data" / "shape_models" / "Bennu2019.obj"  # body-fixed shape model
 SHAPE_UNIT = 1.0e3  # OBJ length unit -> m (the OBJ is in km)
 BODY = "Bennu"
 R_REF = 290.0  # SH reference radius [m]

@@ -97,7 +97,7 @@ HERE = Path(__file__).resolve().parent
 # ============================================================
 
 # --- Shape and gravity field ---
-SHAPE_OBJ = HERE / "ObjFiles" / "Bennu2019.obj"  # OSIRIS-REx shape (frame of the field)
+SHAPE_OBJ = HERE / "data" / "shape_models" / "Bennu2019.obj"  # OSIRIS-REx shape (frame of the field)
 SHAPE_UNIT = 1.0e3  # OBJ length unit -> m (the OBJ is in km)
 BODY = "Bennu"
 N_DEG = 4  # maximum SH degree fitted

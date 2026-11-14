@@ -1237,7 +1237,7 @@ class MCMCModel:
     # Figures: every plot lives in MCMCPlots; these methods only pass the model.
     # Journal figures (Okabe-Ito, LaTeX, one PDF each) need MCMCPlots.configure(...) and
     # MCMCPlots.set_figure_dir(...) first. The quick-look plot_* figures are the original
-    # MCMCModel plots (Tests/ and Extra/ scripts use them).
+    # MCMCModel plots (tests/ and extra/ scripts use them).
     # ------------------------------------------------------------------
     def plot_journal_residuals(self, *args, **kwargs):
         """

@@ -28,7 +28,7 @@ import spiceypy as spice
 # ----------------------------
 # User inputs (edit as needed)
 # ----------------------------
-KERNEL_ROOT = Path("./kernels")
+KERNEL_ROOT = Path("./data/kernels")
 
 # Default window (adjust to the exact particle-ejecta imaging interval you care about)
 START_UTC = "2019-01-19T00:00:00"

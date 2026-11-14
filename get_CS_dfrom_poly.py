@@ -716,7 +716,7 @@ def compute_polyhedral_cs_from_obj(
 
 
 if __name__ == "__main__":
-    obj_path = "ObjFiles/BennuRadar.obj"
+    obj_path = "data/shape_models/BennuRadar.obj"
     C, S, Rref = compute_polyhedral_cs_from_obj(
         obj_path=obj_path,
         n_degree=10,

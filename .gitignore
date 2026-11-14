@@ -1,5 +1,5 @@
-kernels/*
-kernelsJustitia/*
-Extra/srif_inputs_from_RZ.mat
+data/kernels/*
+data/kernels_justitia/*
+data/srif_inputs_from_RZ.mat
 __pycache__/
 *.pyc

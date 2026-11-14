@@ -447,7 +447,7 @@ def plot_prefit_postfit(
 
 def main():
     # ---- USER SETTINGS ----
-    MAT_FILE = "Extra/srif_inputs_from_RZ.mat"
+    MAT_FILE = "data/srif_inputs_from_RZ.mat"
     SAVE_PREFIX = "results/rcvo_linear_dx0"
     TIME_TOL = 1e-5
 

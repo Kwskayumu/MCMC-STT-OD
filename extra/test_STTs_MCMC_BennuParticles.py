@@ -273,7 +273,7 @@ if __name__ == "__main__":
     order = 1
 
     # Load Bennu mesh
-    mesh_path = "ObjFiles/BennuRadar.obj"  # Update with correct path if needed
+    mesh_path = "data/shape_models/BennuRadar.obj"  # Update with correct path if needed
     bennu_mesh = trimesh.load(mesh_path, force="mesh")
     vertices = bennu_mesh.vertices  # shape (N, 3)
     faces = bennu_mesh.faces  # shape (M, 3)

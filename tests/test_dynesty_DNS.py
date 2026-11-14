@@ -1140,7 +1140,7 @@ if __name__ == "__main__":
     # --------------------------
     # USER SETTINGS (edit these)
     # --------------------------
-    KERNEL_ROOT = Path("./kernels")
+    KERNEL_ROOT = Path("./data/kernels")
     SC_NAME = "OSIRIS-REX"
     CENTER = "BENNU"
     FRAME_I = "J2000"
@@ -1234,7 +1234,7 @@ if __name__ == "__main__":
     # --------------------------
     # Particle detach point on Bennu surface
     # --------------------------
-    mesh_path = "ObjFiles/BennuRadar.obj"
+    mesh_path = "data/shape_models/BennuRadar.obj"
     bennu_mesh = trimesh.load(mesh_path, force="mesh")
     vertices = np.asarray(bennu_mesh.vertices)
 

@@ -307,7 +307,7 @@ if __name__ == "__main__":
     # ============================================================
     # Load Bennu mesh (only used to pick a surface point)
     # ============================================================
-    mesh_path = "ObjFiles/BennuRadar.obj"  # Update with correct path if needed
+    mesh_path = "data/shape_models/BennuRadar.obj"  # Update with correct path if needed
     bennu_mesh = trimesh.load(mesh_path, force="mesh")
     vertices = bennu_mesh.vertices
 

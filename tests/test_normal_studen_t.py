@@ -1,51 +1,20 @@
 """
-Scenario (from scratch, but uses your existing STTPropagator + MCMCModel):
+Non-Gaussian SPH posterior scenario with Gaussian priors + Student-t likelihood
 
-- Spacecraft (OSIRIS-REx) trajectory is TRUTH from SPICE SPK (Bennu-centered, J2000).
-- GravityPopper detaches from Bennu surface (point in body-fixed), then propagates in J2000 (Bennu-centered).
-- Bennu rotates with constant spin about its pole (truth alpha/delta). No tau state.
-- GravityPopper dynamics uses degree-2 AND degree-3 gravity potential in body-fixed:
-    U = mu/r * (1
-              + (R_ref/r)^2 * sum_{m=0..2} P2m(sinφ)*(C2m cos mλ + S2m sin mλ)
-              + (R_ref/r)^3 * sum_{m=0..3} P3m(sinφ)*(C3m cos mλ + S3m sin mλ))
-  Acceleration is computed as a = ∇U in body-fixed, then rotated to inertial.
+Same physical setup as test_Claude.py; two changes only:
+  1. Gaussian priors on ALL parameters (µ and SH coefficients included).
+  2. Student-t likelihood (ν = nu_student_t) instead of the Gaussian-mixture.
 
-- You estimate:
-    theta = [δr0(3), δv0(3), δmu(1),
-             δC20, δC21, δS21, δC22, δS22,          (5 degree-2 Stokes coefficients)
-             δC30, δC31, δS31, δC32, δS32, δC33, δS33]  (7 degree-3 Stokes coefficients)
-    -> 19 params total
-  about a reference x0_ref (also 19D state):
-    x = [x, y, z, vx, vy, vz, mu, C20, C21, S21, C22, S22, C30, C31, S31, C32, S32, C33, S33]
+The Student-t with low ν gives heavy-tailed robustness to outliers without
+requiring an explicit mixture model.  Gaussian priors are the natural conjugate
+for a linear Gaussian measurement model and are what a Kalman filter implicitly
+assumes; using them here provides a fair "apples-to-apples" comparison with the
+KF while still allowing the MCMC to capture nonlinear, non-ellipsoidal posteriors.
 
-- Measurements: Radiometric range and range-rate (SC <-> GravityPopper),
-  generated at all epochs but zero-weighted during occultation by Bennu.
-
-Pipeline:
-  1) Propagate truth GravityPopper (19D) with truth params via STTPropagatorND.
-  2) Query SPICE for spacecraft truth state at the same epochs.
-  3) Generate noisy radiometric measurements (range + range-rate) at all epochs;
-     build visibility mask (sphere proxy) and zero-weight occulted epochs.
-  4) Build reference x0_ref (perturb truth) and propagate ref + STTs with STTPropagatorND.
-  5) Stage-1 Gauss-Newton batch MAP (STM-based): iterate linearized normal equations
-     with prior regularization to convergence about x0_ref.
-  6) Stage-2 STT-based MAP: relinearize about Stage-1 solution (x0_ref1),
-     use propagate_deviation with STTPropagatorND for fast residual evaluation.
-  7) MCMC (emcee) around the STT-based residual function to sample the posterior.
-
-IMPORTANT REQUIREMENT:
-- STTPropagatorND must support time-dependent dynamics: f(x,t), A(x,t), Bk(x,t).
-  All generated functions are called as f_func(*x, t), A_func(*x, t), B_funcs[k](*x, t).
-
-You MUST provide SPICE kernels (see load_kernels()):
-  - OSIRIS-REx SPK + attitude + clock kernels
-  - Bennu SPK, shape model DSK, PCK
-  - Leapseconds (naif0012.tls), planetary ephemeris (de424.bsp / de432s.bsp)
-  - Names consistent with kernels: SC_NAME="OSIRIS-REX", CENTER="BENNU", FRAME="J2000"
-
-Units throughout: km, km/s, seconds (ET for SPICE; seconds-since-epoch for dynamics)
+Units: km, km/s, seconds.
 """
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -61,15 +30,35 @@ import trimesh
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 from scipy.stats import norm
+from scipy.stats import uniform as scipy_uniform
 
 from STTPropagationND import STTPropagatorND
 from MCMC import MCMCModel
 
-# Journal figures (Okabe-Ito colors, LaTeX text, one vector PDF per figure) live in MCMCPlots.py;
-# MCMCPlots.configure() in the main applies the journal style.
-import MCMCPlots
-
-MCMCPlots.SHOW_FIGS = True  # plt.show() after each figure is saved
+# Publication-ish defaults
+plt.rcParams.update(
+    {
+        "text.usetex": True,
+        "font.family": "serif",
+        "axes.grid": True,
+        "grid.linestyle": ":",
+        "grid.alpha": 0.7,
+        "font.size": 12,
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 11,
+        "axes.grid": True,
+        "grid.linestyle": ":",
+        "grid.linewidth": 0.8,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    }
+)
+plt.rcParams["text.latex.preamble"] = r"\usepackage{mathrsfs}"
 
 # ============================================================
 # Geometry / utility
@@ -585,6 +574,232 @@ def load_kernels(kernel_root: Path):
 
 
 # ============================================================
+# BETTER TRAJECTORY PLOT USING THE SHAPE MODEL (trimesh)
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+
+def set_axes_equal_3d(ax):
+    """Make 3D axes have equal scale so the mesh doesn't look like a pancake."""
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+
+    x_range = abs(x_limits[1] - x_limits[0])
+    y_range = abs(y_limits[1] - y_limits[0])
+    z_range = abs(z_limits[1] - z_limits[0])
+
+    x_mid = np.mean(x_limits)
+    y_mid = np.mean(y_limits)
+    z_mid = np.mean(z_limits)
+
+    plot_radius = 0.5 * max([x_range, y_range, z_range])
+
+    ax.set_xlim3d([x_mid - plot_radius, x_mid + plot_radius])
+    ax.set_ylim3d([y_mid - plot_radius, y_mid + plot_radius])
+    ax.set_zlim3d([z_mid - plot_radius, z_mid + plot_radius])
+
+
+def add_trimesh_to_ax(
+    ax, mesh, color=(0.7, 0.7, 0.7, 1.0), alpha=0.35, edge_alpha=0.15, max_faces=30000
+):
+    """
+    Render a trimesh.Trimesh on a matplotlib 3D axis.
+    Downsamples faces if mesh is huge (matplotlib dies otherwise).
+    """
+    # Downsample faces if necessary
+    faces = mesh.faces
+    verts = mesh.vertices
+
+    if faces.shape[0] > max_faces:
+        idx = np.random.default_rng(0).choice(
+            faces.shape[0], size=max_faces, replace=False
+        )
+        faces = faces[idx]
+
+    poly3d = verts[faces]  # (F,3,3)
+    coll = Poly3DCollection(poly3d, linewidths=0.2)
+    coll.set_facecolor(color)
+    coll.set_alpha(alpha)
+    coll.set_edgecolor((0.0, 0.0, 0.0, edge_alpha))
+    ax.add_collection3d(coll)
+
+
+def plot_bennu_scene_body_fixed(
+    bennu_mesh,
+    sc_state_full,
+    x_true_full,
+    x_map,
+    tau_full,
+    tau_map,
+    alpha,
+    delta,
+    omega,
+    vis_mask=None,
+    title="OSIRIS-REx + GravityPopper around Bennu (BODY-FIXED)",
+    mesh_target_radius_km=None,
+    mesh_scale_mode="rms",
+    downsample=3,
+):
+    """
+    BODY-FIXED visualization (publication-ready).
+
+    Notes
+    -----
+    - Assumes `bennu_mesh` is already in Bennu body-fixed frame and centered at origin.
+    - `make_bennu_rotation_matrix(alpha, delta, omega, t)` is assumed to return a DCM
+      that maps BODY->INERTIAL (R_bi) or INERTIAL->BODY (R_ib). Many implementations
+      return BODY->INERTIAL; in that common case, the correct inertial->body transform
+      is the transpose.
+    """
+
+    # ------------------------------------------------------------
+    # Downsample
+    # ------------------------------------------------------------
+    sl = slice(None, None, max(1, int(downsample)))
+
+    sc_i = np.asarray(sc_state_full)[sl, :3]
+    pt_i = np.asarray(x_true_full)[sl, :3]
+    tau_i = np.asarray(tau_full)[sl]
+
+    x_map = np.asarray(x_map)
+    tau_map = np.asarray(tau_map)
+    mesh = bennu_mesh
+
+    # ------------------------------------------------------------
+    # Rotate INERTIAL -> BODY-FIXED
+    # ------------------------------------------------------------
+    sc_b = np.zeros_like(sc_i)
+    pt_b = np.zeros_like(pt_i)
+
+    for k, tk in enumerate(tau_i):
+        R_ib = np.asarray(make_bennu_rotation_matrix(alpha, delta, omega, float(tk)))
+        sc_b[k] = R_ib @ sc_i[k]
+        pt_b[k] = R_ib @ pt_i[k]
+
+    # ------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------
+
+    fig = plt.figure(figsize=(7.2, 5.4))
+    ax = fig.add_subplot(111, projection="3d")
+
+    add_trimesh_to_ax(ax, mesh, alpha=0.35, edge_alpha=0.08, max_faces=25000)
+
+    # Trajectories: force colors explicitly
+    ax.plot(
+        sc_b[:, 0],
+        sc_b[:, 1],
+        sc_b[:, 2],
+        linewidth=1.8,
+        alpha=0.95,
+        color="tab:blue",
+        label="OSIRIS-REx (-64)",
+    )
+    ax.plot(
+        pt_b[:, 0],
+        pt_b[:, 1],
+        pt_b[:, 2],
+        linewidth=1.6,
+        alpha=0.95,
+        color="tab:red",
+        label="GravityPopper Truth",
+    )
+
+    # ------------------------------------------------------------
+    # Visible / occulted points (both black)
+    # ------------------------------------------------------------
+    if vis_mask is not None:
+        vis_mask = np.asarray(vis_mask).astype(bool)
+        vis_mask_ds = (
+            vis_mask[sl]
+            if vis_mask.shape[0] >= tau_full[sl].shape[0]
+            else vis_mask[: sc_b.shape[0]]
+        )
+
+        sc_vis = sc_b[vis_mask_ds]
+        sc_occ = sc_b[~vis_mask_ds]
+
+        if sc_vis.size:
+            ax.scatter(
+                sc_vis[:, 0],
+                sc_vis[:, 1],
+                sc_vis[:, 2],
+                s=16,
+                marker="o",
+                color="black",
+                alpha=0.9,
+                label="Measurement Used",
+            )
+        if sc_occ.size:
+            ax.scatter(
+                sc_occ[:, 0],
+                sc_occ[:, 1],
+                sc_occ[:, 2],
+                s=18,
+                marker="x",
+                color="black",
+                alpha=0.9,
+                label="Measurement Unavailable",
+            )
+
+    # ------------------------------------------------------------
+    # Axes / view / limits
+    # ------------------------------------------------------------
+    ax.set_xlabel(r"$X_\mathscr{B}$ [km]", labelpad=10)
+    ax.set_ylabel(r"$Y_\mathscr{B}$ [km]", labelpad=10)
+    ax.set_zlabel(r"$Z_\mathscr{B}$ [km]", labelpad=10)
+    fig.canvas.draw()
+
+    # No title (caption-driven for papers)
+    # ax.set_title(title)
+
+    ax.view_init(elev=10, azim=-120)
+
+    mesh_v = np.asarray(mesh.vertices)
+    all_xyz = np.vstack([mesh_v, sc_b, pt_b])
+
+    mins = np.min(all_xyz, axis=0)
+    maxs = np.max(all_xyz, axis=0)
+    span = maxs - mins
+    span_max = float(np.max(span)) if np.all(np.isfinite(span)) else 1.0
+    pad = 0.08 * span_max
+
+    ax.set_xlim(mins[0] - pad, maxs[0] + pad)
+    ax.set_ylim(mins[1] - pad, maxs[1] + pad)
+    ax.set_zlim(mins[2] - pad, maxs[2] + pad)
+
+    set_axes_equal_3d(ax)
+
+    # Legend: bigger and closer (inside, not outside)
+    ax.legend(
+        loc="upper right",
+        bbox_to_anchor=(0.98, 0.98),
+        frameon=True,
+        borderaxespad=0.2,
+    )
+
+    fig.subplots_adjust(top=0.96, bottom=0.08, left=0.08, right=0.94)
+
+    # Save figure with timestamp (won't overwrite previous)
+    os.makedirs("results", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fig.canvas.draw()
+    fig.savefig(
+        f"results/bennu_scene_body_fixed_{timestamp}.pdf",
+        format="pdf",
+        # bbox_inches="tight",
+        pad_inches=0.20,
+    )
+    print(f"Saved: results/bennu_scene_body_fixed_{timestamp}.pdf")
+
+    plt.show()
+
+
+# ============================================================
 # Gauss-Newton batch solver with STMs
 # ============================================================
 
@@ -907,24 +1122,248 @@ def solve_stage1_full_nonlinear_lsq(
 
 
 # ============================================================
+
+# ============================================================
+# RA/Dec measurement model (angles-only, from SC camera to GravityPopper)
+# ============================================================
+
+
+def wrap_to_pi(x):
+    """Wrap angle (radians) to (-pi, pi]."""
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+
+def radec_and_partials_from_los(los):
+    """
+    los: (N,3) vector from SC to GravityPopper in J2000.
+    Returns:
+      ra, dec: (N,)  RA = arctan2(y,x), Dec = arctan2(z, rho_eq)
+      d_ra_d_r, d_dec_d_r: (N,3)  partials wrt particle position
+    """
+    x = los[:, 0]
+    y = los[:, 1]
+    z = los[:, 2]
+    rxy2 = np.maximum(x * x + y * y, 1e-30)
+    rxy = np.sqrt(rxy2)
+    rho2 = np.maximum(rxy2 + z * z, 1e-30)
+
+    ra = np.arctan2(y, x)
+    dec = np.arctan2(z, rxy)
+
+    d_ra_dx = -y / rxy2
+    d_ra_dy = x / rxy2
+    d_ra_dz = np.zeros_like(z)
+
+    d_dec_drxy = -z / rho2
+    d_dec_dx = d_dec_drxy * (x / rxy)
+    d_dec_dy = d_dec_drxy * (y / rxy)
+    d_dec_dz = rxy / rho2
+
+    d_ra_d_r = np.stack([d_ra_dx, d_ra_dy, d_ra_dz], axis=1)
+    d_dec_d_r = np.stack([d_dec_dx, d_dec_dy, d_dec_dz], axis=1)
+    return ra, dec, d_ra_d_r, d_dec_d_r
+
+
+def generate_opnav_measurements_from_sc(x_part, sc_state, sigma_ra, sigma_dec, rng):
+    """
+    x_part:   (N,19) or (N,6) GravityPopper inertial state.
+    sc_state: (N,6)  spacecraft inertial state.
+    Returns y = [ra_0, dec_0, ra_1, dec_1, ...] (2N,).
+    """
+    los = x_part[:, :3] - sc_state[:, :3]
+    ra, dec, _, _ = radec_and_partials_from_los(los)
+    ra_meas = ra + rng.normal(0.0, sigma_ra, size=ra.shape)
+    dec_meas = dec + rng.normal(0.0, sigma_dec, size=dec.shape)
+    y = np.empty(2 * len(ra))
+    y[0::2] = ra_meas
+    y[1::2] = dec_meas
+    return y
+
+
+def solve_stage1_gn_angles(
+    propagator,
+    x0_ref,
+    tau,
+    sc_state,
+    y_obs,
+    sigma_ra,
+    sigma_dec,
+    obs_weights,
+    priors=None,
+    update_idx=None,
+    max_iter=10,
+    tol=1e-12,
+    rtol=1e-8,
+    atol=1e-10,
+    method="LSODA",
+    verbose=True,
+):
+    """
+    Gauss-Newton MAP for RA/Dec (angles-only) measurements with STM chain rule.
+    Identical logic to solve_stage1_gn_with_stm but replaces range/range-rate
+    with RA/Dec.  The measurement partials only depend on position (no velocity).
+    """
+    if update_idx is None:
+        update_idx = np.arange(19)
+    update_idx = np.asarray(update_idx, dtype=int)
+    n_upd = len(update_idx)
+
+    if priors is None:
+        prior_mean = np.zeros(n_upd)
+        prior_sig = np.full(n_upd, np.inf)
+    else:
+        prior_mean = np.array([p.mean() for p in priors], dtype=float)
+        prior_sig = np.array([p.std() for p in priors], dtype=float)
+
+    delta_total = np.zeros(19)
+    w = np.empty_like(y_obs, dtype=float)
+    w[0::2] = sigma_ra
+    w[1::2] = sigma_dec
+
+    for it in range(1, max_iter + 1):
+        sol_ref, stts_ref = propagator.propagate(
+            x0=x0_ref, t_eval=tau, rtol=rtol, atol=atol, method=method
+        )
+        x_ref = sol_ref.y[:19, :].T  # (N,19)
+
+        Phi_list = np.array(
+            [
+                np.array(stts_ref[1][k], dtype=float).reshape(19, 19)
+                for k in range(len(tau))
+            ]
+        )
+
+        los = x_ref[:, :3] - sc_state[:, :3]
+        ra_m, dec_m, d_ra_d_r, d_dec_d_r = radec_and_partials_from_los(los)
+
+        y_model = np.empty_like(y_obs)
+        y_model[0::2] = ra_m
+        y_model[1::2] = dec_m
+
+        res = np.empty_like(y_obs)
+        res[0::2] = wrap_to_pi(y_obs[0::2] - y_model[0::2])
+        res[1::2] = y_obs[1::2] - y_model[1::2]
+        r = (res / w) * obs_weights
+
+        J = np.zeros((2 * len(tau), n_upd), dtype=float)
+        for k in range(len(tau)):
+            Hy = np.zeros((2, 19), dtype=float)
+            Hy[0, 0:3] = d_ra_d_r[k, :]  # RA partial wrt position only
+            Hy[1, 0:3] = d_dec_d_r[k, :]  # Dec partial wrt position only
+
+            Hx0 = Hy @ Phi_list[k]
+            J[2 * k : 2 * k + 2, :] = Hx0[:, update_idx]
+
+        J[0::2, :] /= sigma_ra
+        J[1::2, :] /= sigma_dec
+        J = J * obs_weights[:, None]
+
+        rows, rhs = [J], [r]
+        finite = np.isfinite(prior_sig)
+        if np.any(finite):
+            Wp = np.diag(1.0 / prior_sig[finite])
+            Jp = np.zeros((Wp.shape[0], n_upd))
+            Jp[:, finite] = Wp
+            rp = (
+                -(delta_total[update_idx][finite] - prior_mean[finite])
+                / prior_sig[finite]
+            )
+            rows.append(Jp)
+            rhs.append(rp)
+
+        A = np.vstack(rows)
+        b = np.hstack(rhs)
+        d_upd, *_ = np.linalg.lstsq(A, b, rcond=None)
+
+        d_full = np.zeros(19)
+        d_full[update_idx] = d_upd
+        x0_ref = x0_ref + d_full
+        delta_total = delta_total + d_full
+
+        step_norm = np.linalg.norm(d_upd)
+        rms = np.sqrt(np.mean(r**2))
+        if verbose:
+            print(f"[GN it {it:02d}] rms={rms:.3e}  step={step_norm:.3e}")
+        if step_norm < tol:
+            break
+
+    try:
+        A_full = np.vstack(rows)
+        cov_upd = np.linalg.inv(A_full.T @ A_full)
+    except np.linalg.LinAlgError:
+        cov_upd = np.linalg.pinv(A_full.T @ A_full)
+
+    cov_full = np.full((19, 19), np.inf)
+    for i, idx_i in enumerate(update_idx):
+        for j, idx_j in enumerate(update_idx):
+            cov_full[idx_i, idx_j] = cov_upd[i, j]
+
+    return x0_ref, delta_total, cov_full
+
+
+# ============================================================
+# Student-t likelihood
+# (replaces the Gaussian-mixture from test_Claude.py)
+# ============================================================
+
+
+class _StudentTLogLikelihood:
+    """Picklable callable for the Student-t likelihood with degrees of freedom nu.
+
+    For each normalised residual r_i the log-density is:
+        log Γ((ν+1)/2) − log Γ(ν/2) − ½ log(νπ) − (ν+1)/2 · log(1 + r_i²/ν)
+    Summed over all residuals this gives the joint log-likelihood.
+    Low ν (e.g. 3–5) gives heavy tails: large residuals are downweighted
+    gracefully without the need for an explicit outlier mixture.
+    """
+
+    def __init__(self, residuals_func, nu):
+        self.residuals_func = residuals_func
+        self.nu = float(nu)
+        self.log_norm = (
+            math.lgamma((nu + 1.0) / 2.0)
+            - math.lgamma(nu / 2.0)
+            - 0.5 * math.log(nu * math.pi)
+        )
+
+    def __call__(self, theta):
+        r = self.residuals_func(theta)
+        return float(
+            np.sum(self.log_norm - (self.nu + 1.0) / 2.0 * np.log(1.0 + r**2 / self.nu))
+        )
+
+
+def make_studentt_log_likelihood(residuals_func, nu):
+    """Return a picklable Student-t log-likelihood callable.
+
+    Patch it onto a plain MCMCModel instance:
+        model.log_likelihood = make_studentt_log_likelihood(residuals_func, nu)
+    """
+    return _StudentTLogLikelihood(residuals_func, nu)
+
+
 # MAIN SCRIPT
 # ============================================================
 
 if __name__ == "__main__":
 
     # --------------------------
-    # USER SETTINGS (edit these)
+    # USER SETTINGS — same proximity-ops scenario as test_Claude.py
+    # Changes from test_Claude.py:
+    #   1) Gaussian priors on ALL parameters (including µ and SH coefficients)
+    #   2) Student-t likelihood (nu_student_t degrees of freedom) instead of Gaussian-mixture
     # --------------------------
-    KERNEL_ROOT = Path("./kernels")
+    KERNEL_ROOT = Path("./data/kernels")
     SC_NAME = "OSIRIS-REX"
     CENTER = "BENNU"
     FRAME_I = "J2000"
     ABCORR = "NONE"
 
-    # Observation window (must be covered by SPK)
+    # REALISTIC ARC: 1-hour, 5-min cadence (standard proximity-ops imaging cadence)
     utc0 = "2019-03-01T00:00:00"
-    utc1 = "2019-03-01T03:00:00"
-    n_obs = 180
+    arc_hours = 1.0  # total arc length [hours]
+    cadence_min = 5.0  # measurement cadence [minutes]
+    # n_obs and ets_full derived after SPICE load
 
     # Bennu physical
     R_bennu = 0.290  # km
@@ -943,19 +1382,19 @@ if __name__ == "__main__":
     # Bennu Gravity Field Truth Values (degree 2×2 + degree 3×3)
     # ============================================================
     # CONVENTION: unnormalized Stokes coefficients.
-    # Reference radius R_ref = 0.2459 km.
+    # Reference radius R_ref = R_bennu = 0.290 km.
 
     mu_true = 4.89044967462e-09  # km^3/s^2
 
     # Degree 2
-    C20_true = 0.060908668621940644  # = -J2
+    C20_true = 0.060908668621940644
     C21_true = -2.8120664615284112e-14
     S21_true = 3.874234999952248e-15
     C22_true = 0.001978445533807606
     S22_true = -0.0007064992913094132
 
     # Degree 3
-    C30_true = -0.004572082563573552  # = -J3
+    C30_true = -0.004572082563573552
     C31_true = 0.0008801840896940344
     S31_true = -0.0005870017273132463
     C32_true = -0.0003193368868974497
@@ -982,87 +1421,60 @@ if __name__ == "__main__":
         dtype=float,
     )
 
-    # Measurement noise levels (1-sigma)
-    # NOTE: 60-sec integration time, Gravity Imaging Radio Observer
-    sigma_range = 1e-5  # km  (1 cm)
-    sigma_range_rate = 1e-11  # km/s  (0.01 μm/s)
+    # REALISTIC OPTICAL NOISE: OSIRIS-REx NavCam ~13.5 µrad/pixel
+    # 1 pixel noise is the operational baseline; 0.1 px is achievable with centroiding.
+    pixel_scale_rad = 13.5e-6  # rad/pixel (NavCam angular resolution)
+    noise_pixels = 1.0  # noise level in pixels (change to 0.1 for centroiding)
+    sigma_angle = noise_pixels * pixel_scale_rad  # ~2.8 arcsec at 1 pixel
+    sigma_ra = sigma_angle
+    sigma_dec = sigma_angle
 
-    # reference is perturbed by these fractions of |truth|
+    # OUTLIER CONTAMINATION: realistic fraction of corrupted measurements.
+    # The Student-t likelihood automatically down-weights large residuals without
+    # requiring an explicit mixture model or manual data editing.
+    outlier_frac = 0.12  # ~12% → expect ~1-2 bad epochs in a 13-point arc
+    outlier_scale = 25.0  # outlier amplitude [sigma]
+
+    # Student-t degrees of freedom — controls tail heaviness.
+    # nu=3: very heavy tails (strong robustness, slower convergence)
+    # nu=5: moderate robustness (a common default)
+    # nu->inf: approaches Gaussian
+    nu_student_t = 3.0
+
     rng_ref = np.random.default_rng(42)
-    ref_pct_r = 0.2  # 20% of each position component
-    ref_pct_v = 0.2  # 20% of each velocity component
-    ref_pct_mu = 0.01  # 1% of mu
-    ref_pct_c = 0.01  # 1% of each C/S coefficient
+    # Start reference at truth so Stage-1 converges quickly
+    ref_pct_r = ref_pct_v = ref_pct_mu = ref_pct_c = 0.0
 
-    # priors (on deltas about the reference) are these fractions of |truth|
-    # NOTE: ach component of the GravityPopper's position is assigned a 250 m a priori
-    # uncertainty, which in three dimensions roughly equates to Bennu's volume.
-    # Each component of the GravityPopper's velocity is assigned a 30 cm/s a priori
-    # uncertainty, which is the same order of magnitude as the escape speeds on
-    # Bennu's surface.
-    # prior_pct_r = ref_pct_r  # 1% of each position component
-    # prior_pct_v = ref_pct_v  # 1% of each velocity component
-    # prior_pct_mu = ref_pct_mu  # 1% of mu
-    # prior_pct_c = ref_pct_c  # 1% of each C/S coefficient
-    sig_prior_r = np.full(3, 0.250)  # km
-    sig_prior_v = np.full(3, 3.0e-4)  # km/s
-    sig_prior_mu = np.abs(mu_true) * 1  # 100% prior on mu
-    sig_prior_c = np.abs(params_true[1:]) * 1  # 100% on C/S terms
-    prior_looseness = 1  # 1.1 * 1e2
+    # GAUSSIAN PRIORS (all parameters)
+    # ---------------------------------
+    # Position / velocity: Gaussian, derived from pre-detachment imaging accuracy
+    sig_prior_r = np.full(3, 0.250)  # 250 m  position uncertainty [km]
+    sig_prior_v = np.full(3, 3.0e-4)  # 0.3 mm/s velocity uncertainty [km/s]
+
+    # mu: Gaussian centred on zero delta, sigma = 30% of truth value.
+    # (Equivalent spread to the Uniform ±30% used in test_Claude.py but Gaussian-shaped.)
+    mu_prior_sigma = np.abs(mu_true) * 0.3
+
+    # SH coefficients: Gaussian, sigma = scale × |truth|.
+    # 3× for degree-2, 5× for degree-3 (same scale factors as the Uniform widths in
+    # test_Claude.py; here sigma = half_width so the 1σ envelope matches the Uniform support).
+    sh_scale = np.where(
+        np.arange(12) < 5,  # indices 0-4: C20,C21,S21,C22,S22 (all deg-2)
+        3.0,
+        5.0,  # 3× for deg-2, 5× for deg-3
+    )
+    sh_prior_sigma = sh_scale * np.abs(params_true[1:])
+    # Guard against near-zero truth values (C21, S21 are ~1e-14): use a
+    # minimum physical floor based on C22 magnitude.
+    sh_floor = np.abs(C22_true) * 0.5
+    sh_prior_sigma = np.maximum(sh_prior_sigma, sh_floor)
 
     # MCMC settings
-    # NOTE: always do a run with burn_in and thin not activated
-    # NOTE: This took 11:21:02<00:00, 19.58it/s!
-    n_walkers = 128  # 10 *
-    n_samples = 800000  # 5 *
-    burn_in = 30000
-    thin = 2000
-    spherical_spread = 1e-4
-
-    # Figures: parameter symbols and display units (km -> m, km/s -> mm/s,
-    # km^3/s^2 -> m^3/s^2; rescaled by powers of ten from the batch sigmas after Stage 1),
-    # one PDF per figure in a timestamped folder (MCMCPlots.SHOW_FIGS at the top of the file)
-    PARAM_SYM = [
-        r"\delta x_0",
-        r"\delta y_0",
-        r"\delta z_0",
-        r"\delta v_{x,0}",
-        r"\delta v_{y,0}",
-        r"\delta v_{z,0}",
-        r"\delta\mu",
-        r"\delta C_{20}",
-        r"\delta C_{21}",
-        r"\delta S_{21}",
-        r"\delta C_{22}",
-        r"\delta S_{22}",
-        r"\delta C_{30}",
-        r"\delta C_{31}",
-        r"\delta S_{31}",
-        r"\delta C_{32}",
-        r"\delta S_{32}",
-        r"\delta C_{33}",
-        r"\delta S_{33}",
-    ]
-    PARAM_BASE_SCALE = np.array([1e3] * 3 + [1e6] * 3 + [1e9] + [1.0] * 12)
-    PARAM_BASE_UNIT = ["m"] * 3 + ["mm/s"] * 3 + [r"m$^3$/s$^2$"] + [""] * 12
-    MCMCPlots.configure(
-        PARAM_SYM,
-        PARAM_BASE_UNIT,
-        PARAM_BASE_SCALE,
-        rotation=make_bennu_rotation_matrix,
-        body="Bennu",
-        target="Gravity Popper",
-        obs_word="Epoch",
-        site_label="Deployment Site",
-        resid_labels=("Range", "Range-Rate"),
-        fallback_dir=Path.home() / "bennu_figures_fallback",
-    )
-    fig_dir = MCMCPlots.set_figure_dir(
-        Path(__file__).resolve().parent
-        / "results"
-        / f"bennu_a3_popper_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    )
-    print(f"[Figures] -> {fig_dir}")
+    n_walkers = 128
+    n_samples = 80_000
+    burn_in = 10_000
+    thin = 100
+    spherical_spread = 0.02
 
     # --------------------------
     # Load SPICE & spacecraft truth (SPICE remains in ET)
@@ -1070,9 +1482,13 @@ if __name__ == "__main__":
     _ = load_kernels(KERNEL_ROOT)
 
     et0 = spice.utc2et(utc0)
-    et1 = spice.utc2et(utc1)
+    et1 = et0 + arc_hours * 3600.0
+    n_obs = round(arc_hours * 60.0 / cadence_min) + 1  # 13 for 1-hr / 5-min
     ets_full = np.linspace(et0, et1, n_obs)  # ET (for SPICE)
     tau_full = ets_full - ets_full[0]  # seconds since start (for dynamics)
+    print(
+        f"[Setup] arc={arc_hours:.1f} hr, cadence={cadence_min:.0f} min, n_obs={n_obs}"
+    )
 
     sc_state_full = np.zeros((n_obs, 6))
     for i, et in enumerate(ets_full):
@@ -1082,7 +1498,7 @@ if __name__ == "__main__":
     # --------------------------
     # GravityPopper detach point on Bennu surface
     # --------------------------
-    mesh_path = "ObjFiles/BennuRadar.obj"
+    mesh_path = "data/shape_models/BennuRadar.obj"
     bennu_mesh = trimesh.load(mesh_path, force="mesh")
     vertices = np.asarray(bennu_mesh.vertices)
 
@@ -1096,8 +1512,9 @@ if __name__ == "__main__":
     )
     vertices = np.asarray(bennu_mesh.vertices)
 
-    lat_desired = np.deg2rad(5.0)
-    lon_desired = np.deg2rad(0.0)
+    # NEAR-EQUATORIAL DETACHMENT at body-fixed longitude 45 deg.
+    lat_desired = np.deg2rad(3.0)
+    lon_desired = np.deg2rad(45.0)
     pos_target = np.array(
         [
             R_bennu * np.cos(lat_desired) * np.cos(lon_desired),
@@ -1131,9 +1548,10 @@ if __name__ == "__main__":
     u -= np.dot(u, rhat) * rhat
     u /= np.linalg.norm(u)
 
-    # add small radial component (+/-) to create two near-degenerate families
-    rad_frac = 0.10  # 10% radial, rest tangential
-    sign = 1.0  # <-- TRICK: if you set this wrong in the reference, batch may lock on wrong lobe
+    # SMALL radial fraction: with only 45 min of data the sign of the radial kick
+    # is poorly constrained, adding mild ambiguity that couples into the SH estimates.
+    rad_frac = 0.03  # 3% radial (vs 10% in original) -> weaker radial signature
+    sign = 1.0
     u = np.sqrt(1 - rad_frac**2) * u + sign * rad_frac * rhat
 
     v0_true = vmag * u
@@ -1169,11 +1587,6 @@ if __name__ == "__main__":
     # --------------------------
     # Observability mask (occultation by Bennu sphere proxy)
     # --------------------------
-    # CRITICAL FIX: Computing visibility mask but NOT filtering the time grid.
-    # Filtering creates irregular time spacing which causes numerical issues
-    # in time-dependent dynamics. Instead, we propagate on the FULL uniform
-    # time grid and only exclude occulted observations from the cost function.
-
     vis_mask_full = occultation_mask(
         sc_state_full[:, 0:3], x_true_full[:, 0:3], R_bennu
     )
@@ -1183,86 +1596,44 @@ if __name__ == "__main__":
     tau = tau_full
     sc_state = sc_state_full
     x_true = x_true_full
-    vis_mask = vis_mask_full  # Keep mask for plotting/diagnostics
+    vis_mask = vis_mask_full
 
     print(f"\nVisibility: {np.sum(vis_mask)}/{len(vis_mask)} epochs visible.")
     print(f"Using all {len(tau)} epochs for propagation (uniform time grid).")
 
     # --------------------------
-    # Observation scene + geometry (truth on a dense grid over the arc)
+    # Generate noisy OPTICAL (RA/Dec) measurements
     # --------------------------
-    tau_dense = np.linspace(tau_full[0], tau_full[-1], 400)
-    sol_dense = propagator.propagate_state_only(
-        x0_true, tau_dense, show_progress=False, rtol=1e-8, atol=1e-10, method="LSODA"
-    )
-    pt_dense = sol_dense.y[:3, :].T
-    r_dense = np.linalg.norm(pt_dense, axis=1)
-    # Epoch 0 is the launch point, on the surface itself, where the inside test is a coin
-    # flip: check the arc after it.
-    n_in_dense = int(
-        np.sum(
-            MCMCPlots.points_inside_mesh(
-                bennu_mesh, pt_dense[1:], tau_dense[1:], alpha_true, delta_true, omega_true
-            )
-        )
-    )
-    print(
-        f"[Scene] truth |r| over the arc: {r_dense.min() * 1e3:.1f}-"
-        f"{r_dense.max() * 1e3:.1f} m; inside the shape model at "
-        f"{n_in_dense}/{tau_dense.size - 1} epochs after launch"
-    )
-    if n_in_dense:
-        print("[WARNING] The truth trajectory crosses the shape model during the arc.")
-    sc_dense = np.array(
-        [
-            spice.spkezr(SC_NAME, float(et0 + t), FRAME_I, ABCORR, CENTER)[0]
-            for t in tau_dense
-        ],
-        dtype=float,
-    )
-    MCMCPlots.plot_scene_body_fixed(
-        bennu_mesh,
-        tau_obs=tau_full,
-        sc_obs=sc_state_full,
-        vis_mask=vis_mask,
-        tau_line=tau_dense,
-        sc_line=sc_dense,
-        pt_line=pt_dense,
-        alpha=alpha_true,
-        delta=delta_true,
-        omega=omega_true,
-        detach_bf=pos_detach_bf,
-    )
-    MCMCPlots.plot_observation_geometry(
-        tau_full,
-        sc_state_full,
-        x_true_full,
-        vis_mask,
-        tau_line=tau_dense,
-        sc_line=sc_dense,
-        pt_line=pt_dense,
-    )
-
-    # --------------------------
-    # Generate noisy RADIOMETRIC measurements
-    # --------------------------
-    # Generate measurements for ALL epochs (including occulted ones)
-    # We'll handle visibility in the residual weighting
     rng_meas = np.random.default_rng(123)
-    y_obs_full = generate_radio_measurements_from_sc(
+    y_obs_full = generate_opnav_measurements_from_sc(
         x_part=x_true,
         sc_state=sc_state,
-        sigma_range=sigma_range,
-        sigma_range_rate=sigma_range_rate,
+        sigma_ra=sigma_ra,
+        sigma_dec=sigma_dec,
         rng=rng_meas,
     )
 
-    # Create a weight vector: zero weight for occulted observations
-    obs_weights = np.ones_like(y_obs_full)
-    obs_weights[0::2][~vis_mask] = 0.0  # Zero weight for occulted range
-    obs_weights[1::2][~vis_mask] = 0.0  # Zero weight for occulted range rate
+    # OUTLIER INJECTION: corrupt a fraction of epochs with large errors.
+    epoch_is_outlier = rng_meas.random(n_obs) < outlier_frac
+    n_outliers = int(np.sum(epoch_is_outlier))
+    if n_outliers > 0:
+        y_obs_full[0::2][epoch_is_outlier] += (
+            outlier_scale * sigma_ra * rng_meas.choice([-1, 1], n_outliers)
+        )
+        y_obs_full[1::2][epoch_is_outlier] += (
+            outlier_scale * sigma_dec * rng_meas.choice([-1, 1], n_outliers)
+        )
+    print(
+        f"[Measurements] Injected {n_outliers}/{n_obs} outlier epochs "
+        f"(amplitude ≈ {outlier_scale:.0f}σ, target rate {100*outlier_frac:.0f}%)"
+    )
 
-    y_obs = y_obs_full  # Use all measurements, rely on weights
+    # Zero weight for occulted observations
+    obs_weights = np.ones_like(y_obs_full)
+    obs_weights[0::2][~vis_mask] = 0.0
+    obs_weights[1::2][~vis_mask] = 0.0
+
+    y_obs = y_obs_full
 
     # --------------------------
     # Reference initial condition (perturb truth)
@@ -1286,71 +1657,48 @@ if __name__ == "__main__":
     print("\n[Reference] deviation from truth:", ref_dev)
 
     # --------------------------
-    # Priors on 19D delta0
+    # Priors on 19D delta0 — ALL GAUSSIAN
     # --------------------------
-    # r_scale = np.linalg.norm(x0_true[0:3])
-    # v_scale = np.linalg.norm(x0_true[3:6])
-    # sig_prior_r = prior_pct_r * r_scale * np.ones(3)
-    # sig_prior_v = prior_pct_v * v_scale * np.ones(3)
-    # sig_prior_mu = np.abs(x0_true[6:7] * prior_pct_mu)
-    # sig_prior_c = np.abs(x0_true[7:19] * prior_pct_c)
+    priors_r = [norm(loc=0.0, scale=s) for s in sig_prior_r]
+    priors_v = [norm(loc=0.0, scale=s) for s in sig_prior_v]
+    priors_mu = [norm(loc=0.0, scale=mu_prior_sigma)]
+    priors_sh = [norm(loc=0.0, scale=s) for s in sh_prior_sigma]
 
-    prior_sigma = prior_looseness * np.hstack(
-        [sig_prior_r, sig_prior_v, sig_prior_mu, sig_prior_c]
-    )
+    priors = priors_r + priors_v + priors_mu + priors_sh
 
-    priors = [norm(loc=0.0, scale=s) for s in prior_sigma]
+    # Equivalent sigma vector (for GN solver and diagnostics)
+    prior_sigma = np.array([p.std() for p in priors], dtype=float)
 
-    print("\n[Prior] sigmas:", prior_sigma)
+    print("\n[Prior] r  sigmas [km]:", sig_prior_r)
+    print("[Prior] v  sigmas [km/s]:", sig_prior_v)
+    print("[Prior] mu sigma (Gaussian) [km³/s²]:", mu_prior_sigma)
+    print("[Prior] SH sigmas (Gaussian):", sh_prior_sigma)
 
     # --------------------------
     # Stage 1: full nonlinear batch with visibility weighting
     # --------------------------
     print("\n[Stage 1] Gauss-Newton batch (first-order STMs) to convergence...")
 
-    x0_ref1, delta_hat1, cov1 = solve_stage1_gn_with_stm(
+    x0_ref1, delta_hat1, cov1 = solve_stage1_gn_angles(
         propagator=propagator,
         x0_ref=x0_ref,
-        tau=tau,  # seconds since start
+        tau=tau,
         sc_state=sc_state,
         y_obs=y_obs,
-        sigma_range=sigma_range,
-        sigma_range_rate=sigma_range_rate,
-        obs_weights=obs_weights,  # Pass visibility weights
-        priors=priors,  # match update_idx length
+        sigma_ra=sigma_ra,
+        sigma_dec=sigma_dec,
+        obs_weights=obs_weights,
+        priors=priors,
         max_iter=15,
         tol=1e-6,
         rtol=1e-8,
         atol=1e-10,
         verbose=True,
     )
-    """
-    x0_ref1, delta_hat1, cov1, res_nl = solve_stage1_full_nonlinear_lsq(
-        propagator=propagator,
-        x0_ref=x0_ref,
-        tau=tau,
-        sc_state=sc_state,
-        y_obs=y_obs,
-        obs_weights=obs_weights,  # Pass visibility weights
-        sigma_ra=sigma_ra,
-        sigma_dec=sigma_dec,
-        priors=priors,
-        update_idx=np.arange(19),
-        rtol=1e-8,
-        atol=1e-10,
-        max_nfev=4000,
-        verbose=2,
-    )"""
 
     print("\n[Stage 1] Covariance diagonal (stdev):")
     print(np.sqrt(np.diag(cov1)))
     print("[Stage 1] delta_hat1:\n", delta_hat1)
-
-    # Display units: rescale each parameter by a power of ten so its batch sigma reads well
-    disp_scale, disp_unit = MCMCPlots.auto_param_scales(
-        PARAM_BASE_SCALE, PARAM_BASE_UNIT, np.sqrt(np.diag(cov1))
-    )
-    MCMCPlots.configure(PARAM_SYM, disp_unit, disp_scale)
 
     # --------------------------
     # Stage 2: relinearize STTs about ref1
@@ -1366,24 +1714,21 @@ if __name__ == "__main__":
     def residuals_normalized(delta0):
         _, x_est = propagator.propagate_deviation(sol_ref, stts_ref, delta0)
 
-        rel_state = x_est[:, :6] - sc_state[:, :6]
-        range_model, range_rate_model, _, _ = range_rate_and_partials_from_rel_state(
-            rel_state
-        )
+        los = x_est[:, :3] - sc_state[:, :3]
+        ra_m, dec_m, _, _ = radec_and_partials_from_los(los)
 
         y_model = np.empty_like(y_obs)
-        y_model[0::2] = range_model
-        y_model[1::2] = range_rate_model
+        y_model[0::2] = ra_m
+        y_model[1::2] = dec_m
 
         res = np.empty_like(y_obs)
-        res[0::2] = y_obs[0::2] - y_model[0::2]
+        res[0::2] = wrap_to_pi(y_obs[0::2] - y_model[0::2])
         res[1::2] = y_obs[1::2] - y_model[1::2]
 
         w = np.empty_like(y_obs)
-        w[0::2] = sigma_range
-        w[1::2] = sigma_range_rate
+        w[0::2] = sigma_ra
+        w[1::2] = sigma_dec
 
-        # Apply visibility weighting
         return (res / w) * obs_weights
 
     # --------------------------
@@ -1397,19 +1742,28 @@ if __name__ == "__main__":
         f"(chi2={chi2_at_ref:.2f}, dof={dof}, n_vis={n_visible})"
     )
 
-    # Priors for MCMC
+    # Priors for MCMC — all Gaussian, shifted to be centred on the Stage-1 MAP.
     delta_shift = x0_ref1 - x0_ref
-    priors_ref1 = [norm(loc=-ds, scale=s) for ds, s in zip(delta_shift, prior_sigma)]
+    priors_ref1 = [norm(loc=-delta_shift[i], scale=priors[i].std()) for i in range(19)]
 
     # --------------------------
-    # MCMC
+    # MCMC with Student-t likelihood (ν = nu_student_t)
+    # Replacing MCMCModel's default Gaussian log_likelihood with a Student-t is
+    # the only change from a vanilla Gaussian run.
     # --------------------------
-    print("\n[MCMC] Running (starting from zeros about ref1)...")
+    print(
+        f"\n[MCMC] Running with Student-t likelihood (ν={nu_student_t:.1f}) "
+        f"and Gaussian priors..."
+    )
     model = MCMCModel(
         residuals_func=residuals_normalized,
         initial_params=np.zeros(19),
         param_priors=priors_ref1,
         observed_data=y_obs,
+    )
+    # Patch the log_likelihood in-place — no subclass needed.
+    model.log_likelihood = make_studentt_log_likelihood(
+        residuals_normalized, nu_student_t
     )
     model.setup_whitening_from_priors()
     model.run(
@@ -1437,20 +1791,82 @@ if __name__ == "__main__":
     print("\n[Truth] true_delta about ref1:\n", true_delta)
 
     # --------------------------
-    # Diagnostics + journal figures (residuals, traces, autocorrelation, corner)
+    # Diagnostics
     # --------------------------
-    # Samples are deviations about the batch solution ref1, so the batch estimate is 0 with
-    # covariance cov1.
+    model.plot_convergence()
+    model.plot_postfit_residuals_time(t_obs_used=tau, opnav_data=True)  # RA/Dec
     model.summary()
     model.print_regression_diagnostics()
-    model.plot_journal_diagnostics(
-        burn_in,
-        thin,
-        tau,
-        vis_mask,
-        true_theta=true_delta,
-        batch_cov=cov1,
-        acf_groups=[list(range(6)), list(range(6, 12)), list(range(12, 19))],
+    model.plot_autocorrelation()
+    model.plot_log_likelihood()
+
+    # --------------------------
+    # Plot scene (using MCMC mean estimate)
+    # --------------------------
+    _, x_map = propagator.propagate_deviation(sol_ref, stts_ref, theta_hat)
+
+    plot_bennu_scene_body_fixed(
+        bennu_mesh=bennu_mesh,
+        sc_state_full=sc_state_full,
+        x_true_full=x_true_full,
+        x_map=x_map,
+        tau_full=tau_full,
+        tau_map=tau,
+        alpha=alpha_true,
+        delta=delta_true,
+        omega=omega_true,
+        vis_mask=vis_mask,
+        mesh_target_radius_km=R_bennu,
+        mesh_scale_mode="rms",
+        downsample=2,
     )
+
+    # --------------------------
+    # Plot visibility mask
+    # --------------------------
+    t_hr = tau_full / 3600.0
+    plt.figure(figsize=(10, 2.6))
+    plt.plot(t_hr, vis_mask.astype(int), "o-")
+    plt.ylim(-0.1, 1.1)
+    plt.yticks([0, 1], ["occulted", "visible"])
+    plt.xlabel("Time since start [hr]")
+    plt.title("Occultation / Visibility Mask (sphere proxy)")
+    plt.grid(True, linestyle=":")
+    plt.tight_layout()
+    plt.show()
+
+    # --------------------------
+    # Corner plot
+    # --------------------------
+    try:
+        labels = [
+            r"$\delta x_0$",
+            r"$\delta y_0$",
+            r"$\delta z_0$",
+            r"$\delta v_{x0}$",
+            r"$\delta v_{y0}$",
+            r"$\delta v_{z0}$",
+            r"$\delta \mu$",
+            r"$\delta C_{20}$",
+            r"$\delta C_{21}$",
+            r"$\delta S_{21}$",
+            r"$\delta C_{22}$",
+            r"$\delta S_{22}$",
+            r"$\delta C_{30}$",
+            r"$\delta C_{31}$",
+            r"$\delta S_{31}$",
+            r"$\delta C_{32}$",
+            r"$\delta S_{32}$",
+            r"$\delta C_{33}$",
+            r"$\delta S_{33}$",
+        ]
+        model.plot_corner_with_batch(
+            batch_mean=np.zeros(19),
+            batch_cov=cov1,
+            use_median_as_truth=False,
+            true_theta=true_delta,
+        )
+    except Exception as e:
+        print("\n[Corner] Skipped.", e)
 
     spice.kclear()

@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------
 # Kernel loading
 # ---------------------------------------------------------------------
-META_KERNEL = "kernelsJustitia/kernels.tm"
+META_KERNEL = "data/kernels_justitia/kernels.tm"
 
 # ---------------------------------------------------------------------
 # Epoch definition

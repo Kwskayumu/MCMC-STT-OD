@@ -8,7 +8,7 @@ STTPropagatorND + MCMCModel):
   no hovering control), body-centered J2000.
   [261110: originally a ~2 km terminator orbit around Ryugu]
 - Body: the Ryugu shape scaled by 320/900 (289P/Blanpain size), density 600 kg/m^3, Ryugu spin.
-  Heliocentric ephemeris: JPL Horizons SPK of 289P/Blanpain (kernels/), used for the Sun
+  Heliocentric ephemeris: JPL Horizons SPK of 289P/Blanpain (data/kernels/), used for the Sun
   position relative to the body (third-body + SRP). [261110: originally the Ryugu SPK]
 - Observation epochs: n_obs epochs evenly spaced on [0, T], where T is the time at which the
   true particle leaves the camera FOV (boresight fixed on the ejection site at t = 0).
@@ -538,7 +538,7 @@ def load_kernels(kernel_root: Path, body_spk: Path):
     2025-May-23 解。SPICE ID 1000750）:
       https://ssd.jpl.nasa.gov/api/horizons.api?format=json&COMMAND='DES=289P;CAP;'
           &EPHEM_TYPE=SPK&START_TIME='2030-01-01'&STOP_TIME='2040-01-01'
-      (base64-decode the "spk" field into kernels/ryugu/blanpain_1000750_2030_2040.bsp)
+      (base64-decode the "spk" field into data/kernels/ryugu/blanpain_1000750_2030_2040.bsp)
     """
     kernels = [
         str(kernel_root / "naif0012.tls"),
@@ -592,10 +592,10 @@ if __name__ == "__main__":
     # --------------------------
     # USER SETTINGS (edit these)
     # --------------------------
-    # Kernels and shape model from this repo (kernels/, ObjFiles/), resolved relative to this
+    # Kernels and shape model from this repo (data/kernels/, data/shape_models/), resolved relative to this
     # file so the run does not depend on the cwd
     HERE = Path(__file__).resolve().parent
-    KERNEL_ROOT = HERE / "kernels"
+    KERNEL_ROOT = HERE / "data" / "kernels"
     SC_NAME = "CSR-30 (notional)"  # notional 2030s Japanese comet sample-return concept
     # 261110: 太陽との位置関係は Blanpain（289P）の SPK で与える（元は Ryugu の SPK、ID 20162173）。
     # 形状・自転は縮小した Ryugu のまま
@@ -616,7 +616,7 @@ if __name__ == "__main__":
     fov_dt = 1.0  # s, FOV から出る時刻を探す刻み
 
     # Ryugu physical (Watanabe et al. 2019, Science 364, 268)
-    shape_path = str(HERE / "ObjFiles/Ryugu/SHAPE_SFM_49k_v20180804.obj")  # km, body-fixed
+    shape_path = str(HERE / "data/shape_models/Ryugu/SHAPE_SFM_49k_v20180804.obj")  # km, body-fixed
     # 261110: Ryugu 形状を 289P（直径 320 m）の大きさへ縮小する。前例 rdvpy_code/mesh/ryugu320_900.obj
     # と同じ 320/900 倍（Ryugu 直径 ~900 m → 320 m）。ただしメッシュは Giovanni の 49k をコードで縮小する
     SHAPE_SCALE = 320.0 / 900.0

@@ -1073,7 +1073,7 @@ if __name__ == "__main__":
     # Changes vs. test_Claude.py  : Gaussian priors (Uniform → Gaussian for µ and SH)
     # Changes vs. test_Claude2.py : Gaussian-mixture likelihood (Student-t → mixture)
     # --------------------------
-    KERNEL_ROOT = Path("./kernels")
+    KERNEL_ROOT = Path("./data/kernels")
     SC_NAME = "OSIRIS-REX"
     CENTER = "BENNU"
     FRAME_I = "J2000"
@@ -1180,7 +1180,7 @@ if __name__ == "__main__":
     # --------------------------
     # GravityPopper detach point
     # --------------------------
-    mesh_path = "ObjFiles/BennuRadar.obj"
+    mesh_path = "data/shape_models/BennuRadar.obj"
     bennu_mesh = trimesh.load(mesh_path, force="mesh")
     vertices = np.asarray(bennu_mesh.vertices)
 
