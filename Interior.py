@@ -16,6 +16,21 @@ AngularGrid
 
         mass = int R^3 / 3 dOmega,  first = int u R^4 / 4 dOmega,  second = int u u^T R^5 / 5 dOmega.
 
+Polyhedra: mass integrals and spherical-harmonic coefficients
+-------------------------------------------------------------
+mesh_volume, RadialLimit, fibonacci_sphere
+    Signed volume, radial containment limit of a star-shaped mesh, quasi-uniform directions.
+Moments, polyhedron_moments, BallRule, ellipsoid_moments
+    Unit-density mass, first and second moments and unnormalized SH integrals of a polyhedron
+    (exact Gauss quadrature on the origin-apex tetrahedra: tetra_gauss, face_tetrahedra,
+    tetra_points) and of a triaxial ellipsoid.
+central_inertia, inertia_tensor
+    Centre of mass and inertia tensor about it; principal moments and axes.
+sh_terms, cs_index, flatten_cs, cs_names, fully_normalized_legendre
+    (n, m) orderings, coefficient vectors and labels, fully normalized Legendre functions.
+tangent_basis, axis_offset
+    Small-angle offsets of an observed axis (spin pole, long axis).
+
 Two-layer moments of inertia (Ermakov 2026, PSJ 7:170)
 -------------------------------------------------------
 inertia_quantities, TwoLayer, endmember_map, masked_extreme, moment_grid_H_range
@@ -27,17 +42,28 @@ SolarPrecession
 MomentsPosterior, TwoLayerPosterior, LogCoreCoordinates
     MCMC (a) on (A_bar, B_bar, C_bar) and MCMC (b) on (r2, rho2, w), the latter sampled in
     phi = (ln r2, ln(rho2 - rho_mean), w).
-initialize_walkers, run_emcee, flat_posterior, with_mean_moment
-    Least-squares walker starts, emcee with differential-evolution moves, burn-in/thinning.
-plot_endmembers, plot_sigma_I, plot_mean_moment, plot_traces, plot_core_sections,
-summary_row, ci_string
-    Figures (house style of MCMCPlots.py) and summary lines.
+initialize_walkers, multistart_walkers
+    Least-squares walker starts (from the prior mean / from given multi-starts).
+run_sampler, run_emcee, flat_posterior, with_mean_moment
+    emcee with differential-evolution moves (optionally in a process pool), burn-in/thinning.
+plot_endmembers, plot_sigma_I, plot_mean_moment, plot_traces, plot_core_sections
+    Figures of the two-layer scripts (house style of MCMCPlots.py).
+plot_trace_grid, plot_residual_band
+    Walker traces on a 3-column grid; normalized residuals with a posterior predictive band.
+
+Outputs
+-------
+results_dir, write_npz, write_text, quantiles, summary_row, ci_string
+    results/<script>_<timestamp>/ directory, chain and summary files, summary numbers.
 """
 
 from __future__ import annotations
 
+import io
 import math
+from datetime import datetime
 from math import factorial
+from pathlib import Path
 
 import emcee
 import matplotlib.pyplot as plt
@@ -386,6 +412,400 @@ class AngularGrid:
 
 
 # ============================================================
+# Polyhedra: mass integrals and spherical-harmonic coefficients
+# ============================================================
+
+
+def mesh_volume(V, T):
+    """Signed volume of a closed triangle mesh (origin-apex tetrahedra), > 0 if outward-oriented."""
+    v0 = V[T[:, 0]]
+    v1 = V[T[:, 1]]
+    v2 = V[T[:, 2]]
+    return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
+
+
+class RadialLimit:
+    """
+    Inner radius of the outer surface as a function of direction from the shape origin.
+
+    Directions are binned on an equal-area grid (uniform in sin(latitude) and longitude);
+    each bin holds the smallest radius of the vertices and face centroids that fall in it,
+    so the limit is conservative where the surface is rough or overhangs. Empty bins take
+    the minimum of their neighbours.
+
+    Parameters
+    ----------
+    V : ndarray, shape (n_v, 3)
+        Vertices [m].
+    T : ndarray of int, shape (n_t, 3)
+        Triangles.
+    n_z, n_lon : int
+        Bins in sin(latitude) and longitude.
+    """
+
+    def __init__(self, V, T, n_z=90, n_lon=180):
+        self.n_z, self.n_lon = int(n_z), int(n_lon)
+        P = np.vstack([V, V[T].mean(axis=1)])
+        iz, il, r = self._bins(P)
+        R = np.full((self.n_z, self.n_lon), np.inf)
+        np.minimum.at(R, (iz, il), r)
+        while np.isinf(R).any():  # fill empty bins from their neighbours
+            nb = np.stack(
+                [np.roll(R, s, axis=ax) for ax in (0, 1) for s in (1, -1)], axis=0
+            ).min(axis=0)
+            R = np.where(np.isinf(R), nb, R)
+        self.R = R
+
+    def _bins(self, P):
+        r = np.linalg.norm(P, axis=-1)
+        sz = np.divide(P[..., 2], r, out=np.zeros_like(r), where=r > 0)
+        lon = np.arctan2(P[..., 1], P[..., 0])
+        iz = np.clip(((sz + 1.0) * 0.5 * self.n_z).astype(int), 0, self.n_z - 1)
+        il = np.clip(((lon + np.pi) / (2 * np.pi) * self.n_lon).astype(int), 0, self.n_lon - 1)
+        return iz, il, r
+
+    def margin(self, P):
+        """
+        Distance below the surface of each point, along its direction from the origin.
+
+        Parameters
+        ----------
+        P : ndarray, shape (..., 3)
+            Points [m].
+
+        Returns
+        -------
+        ndarray, shape (...)
+            Surface radius minus point radius [m] (negative outside).
+        """
+        iz, il, r = self._bins(P)
+        return self.R[iz, il] - r
+
+
+def fibonacci_sphere(n):
+    """n quasi-uniform unit vectors (Fibonacci lattice), shape (n, 3)."""
+    k = np.arange(n) + 0.5
+    z = 1.0 - 2.0 * k / n
+    phi = np.pi * (1.0 + 5.0**0.5) * k
+    s = np.sqrt(1.0 - z * z)
+    return np.column_stack([s * np.cos(phi), s * np.sin(phi), z])
+
+
+class Moments:
+    """
+    Mass integrals of a body, linear in density.
+
+    Attributes
+    ----------
+    mass : float
+        int dm (a volume [m^3] for unit density).
+    first : ndarray, shape (3,)
+        int x dm.
+    second : ndarray, shape (3, 3)
+        int x x^T dm.
+    Ic, Is : ndarray, shape (n_max + 1, n_max + 1)
+        int V_nm dm (solid_harmonics), so that Cbar_nm = Ic[n, m] / ((2n + 1) mass).
+    """
+
+    def __init__(self, mass, first, second, Ic, Is):
+        self.mass, self.first, self.second, self.Ic, self.Is = mass, first, second, Ic, Is
+
+    def combine(self, k_self, other, k_other):
+        """k_self * self + k_other * other (e.g. densities of mantle and core)."""
+        return Moments(
+            *(
+                k_self * getattr(self, a) + k_other * getattr(other, a)
+                for a in ("mass", "first", "second", "Ic", "Is")
+            )
+        )
+
+
+def tetra_gauss(deg):
+    """
+    Gauss rules in (t, s, q) for polynomials of degree <= deg on the origin-apex tetrahedra.
+
+    x = t [(1 - s) v0 + s (1 - q) v1 + s q v2] maps the unit cube onto the tetrahedron
+    (0, v0, v1, v2) with dV = 6 vol t^2 s dt ds dq (Duffy), so the integrand is of degree
+    deg + 2 in t, deg + 1 in s and deg in q.
+
+    Returns
+    -------
+    (t, wt), (s, ws), (q, wq) : gauss01 rules
+    """
+    return gauss01((deg + 4) // 2), gauss01((deg + 3) // 2), gauss01((deg + 2) // 2)
+
+
+def face_tetrahedra(V, T, chunk):
+    """
+    Batches of the origin-apex tetrahedra (0, v0, v1, v2) of the faces.
+
+    Yields
+    ------
+    v0, v1, v2 : ndarray, shape (n, 3)
+        Face vertices (n <= chunk).
+    vol : ndarray, shape (n,)
+        Signed tetrahedron volumes.
+    """
+    for i in range(0, len(T), chunk):
+        v0, v1, v2 = (V[T[i : i + chunk, k]] for k in range(3))
+        yield v0, v1, v2, np.einsum("ij,ij->i", v0, np.cross(v1, v2)) / 6.0
+
+
+def tetra_points(c0, c1, c2, v0, v1, v2):
+    """Points c0 v0 + c1 v1 + c2 v2 of every face and node, shape (n_faces * n_nodes, 3)."""
+    return (
+        c0[None, :, None] * v0[:, None, :]
+        + c1[None, :, None] * v1[:, None, :]
+        + c2[None, :, None] * v2[:, None, :]
+    ).reshape(-1, 3)
+
+
+def polyhedron_moments(V, T, n_max, r_ref, chunk=4000):
+    """
+    Unit-density mass integrals of a closed polyhedron, exact up to degree n_max.
+
+    The body is split into the signed tetrahedra (origin, v0, v1, v2) of its faces, each
+    integrated with the tensor Gauss rule of tetra_gauss.
+
+    Parameters
+    ----------
+    V : ndarray, shape (n_v, 3)
+        Vertices [m].
+    T : ndarray of int, shape (n_t, 3)
+        Outward-oriented triangles.
+    n_max : int
+        Maximum SH degree (>= 2, for the inertia tensor).
+    r_ref : float
+        Reference radius [m].
+    chunk : int
+        Faces per vectorized batch.
+
+    Returns
+    -------
+    Moments
+    """
+    (t, wt), (s, ws), (q, wq) = tetra_gauss(max(n_max, 2))
+    TT, SS, QQ = (g.ravel() for g in np.meshgrid(t, s, q, indexing="ij"))
+    W = (np.einsum("i,j,k->ijk", wt * t**2, ws * s, wq)).ravel() * 6.0
+    c0, c1, c2 = TT * (1.0 - SS), TT * SS * (1.0 - QQ), TT * SS * QQ  # barycentric
+
+    mass, first, second = 0.0, np.zeros(3), np.zeros((3, 3))
+    Ic = np.zeros((n_max + 1, n_max + 1))
+    Is = np.zeros_like(Ic)
+    for v0, v1, v2, vol in face_tetrahedra(V, T, chunk):
+        P = tetra_points(c0, c1, c2, v0, v1, v2)
+        w = (vol[:, None] * W[None, :]).ravel()
+        mass += w.sum()
+        first += w @ P
+        second += (P * w[:, None]).T @ P
+        Vc, Vs = solid_harmonics(P, n_max, r_ref)
+        Ic += Vc @ w
+        Is += Vs @ w
+    return Moments(mass, first, second, Ic, Is)
+
+
+class BallRule:
+    """
+    Gauss rule on the unit ball, exact for polynomials of degree <= n_max.
+
+    Gauss-Legendre in r (weight r^2 included) and in cos(theta), trapezoid in longitude.
+
+    Attributes
+    ----------
+    U : ndarray, shape (Q, 3)
+        Nodes.
+    w : ndarray, shape (Q,)
+        Weights (sum 4 pi / 3).
+    """
+
+    def __init__(self, n_max):
+        r, wr = gauss01(n_max // 2 + 3)
+        mu, wmu = np.polynomial.legendre.leggauss(n_max // 2 + 2)
+        n_phi = n_max + 2
+        phi = 2.0 * np.pi * np.arange(n_phi) / n_phi
+        R, MU, PHI = (g.ravel() for g in np.meshgrid(r, mu, phi, indexing="ij"))
+        sth = np.sqrt(1.0 - MU**2)
+        self.U = np.column_stack([R * sth * np.cos(PHI), R * sth * np.sin(PHI), R * MU])
+        self.w = np.einsum("i,j,k->ijk", wr * r**2, wmu, np.full(n_phi, 2 * np.pi / n_phi)).ravel()
+
+
+def ellipsoid_moments(axes, center, n_max, r_ref, rule):
+    """
+    Unit-density mass integrals of an ellipsoid aligned with the frame axes.
+
+    Mass, first and second moments are analytic; the solid-harmonic integrals use `rule`
+    mapped to the ellipsoid (x = center + axes * u), which is exact for degree <= n_max.
+
+    Parameters
+    ----------
+    axes : array_like, shape (3,)
+        Semi-axes along x, y, z [m].
+    center : array_like, shape (3,)
+        Centre [m].
+    n_max : int
+        Maximum SH degree.
+    r_ref : float
+        Reference radius [m].
+    rule : BallRule
+
+    Returns
+    -------
+    Moments
+    """
+    axes, center = np.asarray(axes, float), np.asarray(center, float)
+    vol = 4.0 / 3.0 * np.pi * np.prod(axes)
+    Vc, Vs = solid_harmonics(center + rule.U * axes, n_max, r_ref)
+    w = rule.w * np.prod(axes)
+    return Moments(
+        vol,
+        vol * center,
+        vol * (np.diag(axes**2) / 5.0 + np.outer(center, center)),
+        Vc @ w,
+        Vs @ w,
+    )
+
+
+def central_inertia(mass, first, second):
+    """
+    Centre of mass [m] and inertia tensor about it, from int dm, int x dm, int x x^T dm.
+
+    Returns
+    -------
+    com : ndarray, shape (3,)
+    I : ndarray, shape (3, 3)
+    """
+    com = first / mass
+    Sc = second - mass * np.outer(com, com)
+    return com, np.trace(Sc) * np.eye(3) - Sc
+
+
+def inertia_tensor(mom):
+    """
+    Inertia tensor about the centre of mass and its principal axes.
+
+    Parameters
+    ----------
+    mom : Moments
+        Mass integrals [kg, kg m, kg m^2].
+
+    Returns
+    -------
+    com : ndarray, shape (3,)
+        Centre of mass [m].
+    I : ndarray, shape (3, 3)
+        Inertia tensor about the centre of mass [kg m^2].
+    moments : ndarray, shape (3,)
+        Principal moments A <= B <= C [kg m^2].
+    axes : ndarray, shape (3, 3)
+        Principal axes as columns (e_A, e_B, e_C).
+    """
+    com, I = central_inertia(mom.mass, mom.first, mom.second)
+    moments, axes = np.linalg.eigh(I)
+    return com, I, moments, axes
+
+
+def sh_terms(n_max, exclude_c00=True):
+    """(n, m) for n = 0..n_max, m = 0..n, without (0, 0) if exclude_c00."""
+    return [(n, m) for n in range(n_max + 1) for m in range(n + 1)
+            if not (exclude_c00 and n == 0 and m == 0)]
+
+
+def cs_index(n_max):
+    """(kind, n, m) of the observed coefficients: degree 1..n_max, C_nm for m >= 0, S_nm for m >= 1."""
+    out = []
+    for n in range(1, n_max + 1):
+        for m in range(n + 1):
+            out.append(("C", n, m))
+            if m > 0:
+                out.append(("S", n, m))
+    return out
+
+
+def flatten_cs(C, S, n_degree, exclude_c00=True):
+    """
+    Stack the coefficients as [C_nm ..., S_nm ...] in sh_terms order.
+
+    Parameters
+    ----------
+    C, S : ndarray, shape (>= n_degree + 1, >= n_degree + 1)
+    n_degree : int
+    exclude_c00 : bool
+        Skip (n, m) = (0, 0) in both blocks.
+
+    Returns
+    -------
+    ndarray, shape (2 n_terms,)
+    """
+    nm = sh_terms(n_degree, exclude_c00)
+    return np.array([C[n, m] for n, m in nm] + [S[n, m] for n, m in nm], dtype=float)
+
+
+def cs_names(n_degree, exclude_c00=True):
+    """Labels of the entries of flatten_cs, e.g. 'C20', 'S22'."""
+    nm = sh_terms(n_degree, exclude_c00)
+    return [f"C{n}{m}" for n, m in nm] + [f"S{n}{m}" for n, m in nm]
+
+
+def fully_normalized_legendre(nmax, x):
+    """
+    Fully normalized associated Legendre functions Pbar_nm(x), x = sin(latitude).
+
+    Normalization: the integral of Pbar_nm^2 [cos^2, sin^2](m lam) over the unit sphere is
+    4 pi, so Pbar_10 = sqrt(3) x and Pbar_11 = sqrt(3) sqrt(1 - x^2). Standard
+    sectoral / subdiagonal / column recursions.
+
+    Parameters
+    ----------
+    nmax : int
+        Maximum degree.
+    x : float
+        sin(latitude), in [-1, 1].
+
+    Returns
+    -------
+    ndarray, shape (nmax + 1, nmax + 1)
+        P[n, m] (zero for m > n).
+    """
+    P = np.zeros((nmax + 1, nmax + 1), dtype=float)
+    P[0, 0] = 1.0
+    if nmax == 0:
+        return P
+
+    sx = math.sqrt(max(0.0, 1.0 - x * x))
+    for m in range(1, nmax + 1):
+        # Pbar_11 = sqrt(3) cos(phi); for m >= 2 the delta_m0 normalization factor is constant
+        f = math.sqrt(3.0) if m == 1 else math.sqrt((2.0 * m + 1.0) / (2.0 * m))
+        P[m, m] = f * sx * P[m - 1, m - 1]
+
+    for m in range(0, nmax):
+        P[m + 1, m] = math.sqrt(2.0 * m + 3.0) * x * P[m, m]
+
+    for m in range(0, nmax + 1):
+        for n in range(m + 2, nmax + 1):
+            a = math.sqrt(((2.0 * n + 1.0) * (2.0 * n - 1.0)) / ((n - m) * (n + m)))
+            b = math.sqrt(
+                ((2.0 * n + 1.0) * (n + m - 1.0) * (n - m - 1.0))
+                / ((2.0 * n - 3.0) * (n - m) * (n + m))
+            )
+            P[n, m] = a * x * P[n - 1, m] - b * P[n - 2, m]
+    return P
+
+
+def tangent_basis(u):
+    """Two unit vectors orthogonal to the unit vector u (and to each other)."""
+    a = np.eye(3)[np.argmin(np.abs(u))]
+    t1 = np.cross(u, a)
+    t1 /= np.linalg.norm(t1)
+    return t1, np.cross(u, t1)
+
+
+def axis_offset(e, u_obs, t1, t2):
+    """Small-angle offset [rad] of the axis e (sign-free) from u_obs, along t1 and t2."""
+    e = e if e @ u_obs >= 0.0 else -e
+    return np.array([e @ t1, e @ t2])
+
+
+# ============================================================
 # Two-layer moments of inertia
 # ============================================================
 
@@ -413,9 +833,7 @@ def inertia_quantities(mass, first, second, r0, axes=False):
         A, B, C (normalized by M r0^2, ascending), J2, C22, H, I (mean moment), com [m],
         and with axes=True, axes (principal axes as columns, in the order A, B, C).
     """
-    com = first / mass
-    Sc = second - mass * np.outer(com, com)
-    Ic = np.trace(Sc) * np.eye(3) - Sc
+    com, Ic = central_inertia(mass, first, second)
     if axes:
         lam, vec = np.linalg.eigh(Ic)
     else:
@@ -808,6 +1226,124 @@ def initialize_walkers(post, n_walkers, rng, chi2_tol=25.0):
     return np.array(p0), best.x
 
 
+def multistart_walkers(post, starts, n_walkers, rng, lo, hi, select="cost", max_nfev=400,
+                       max_draws=None):
+    """
+    Multi-start bounded least squares, then walkers around the best fit.
+
+    Walkers are drawn from N(theta_map, cov), cov = (J^T J)^-1 at the best fit (a small
+    diagonal 1e-4 (hi - lo) if J^T J is singular), and redrawn until they have finite
+    posterior.
+
+    Parameters
+    ----------
+    post : callable
+        Log posterior, with a residuals(theta) method (normalized residuals).
+    starts : iterable of ndarray, shape (ndim,)
+        Least-squares starting points (e.g. prior draws).
+    n_walkers : int
+    rng : numpy.random.Generator
+        For the walker draws.
+    lo, hi : ndarray, shape (ndim,)
+        Bounds of the fits (prior box).
+    select : {"cost", "logp"}
+        Best fit: smallest chi2, or largest log posterior (a fit outside the prior support,
+        log p = -inf, is never selected).
+    max_nfev : int
+        Function evaluations per fit.
+    max_draws : int, optional
+        Walker draws before falling back to the small diagonal (None: no limit).
+
+    Returns
+    -------
+    p0 : ndarray, shape (n_walkers, ndim)
+    theta_map : ndarray, shape (ndim,)
+        Best fit.
+    cov : ndarray, shape (ndim, ndim) or None
+        Its covariance (None if singular).
+
+    Raises
+    ------
+    RuntimeError
+        If select="logp" and no fit has finite log posterior.
+    """
+    starts = list(starts)
+    width = hi - lo
+    best, best_lp = None, -np.inf
+    for k, x0 in enumerate(starts):
+        sol = least_squares(
+            post.residuals, x0, bounds=(lo, hi), x_scale=width, method="trf",
+            xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=max_nfev,
+        )
+        lp = post(sol.x)
+        print(f"[Init] start {k + 1:2d}/{len(starts)}: chi2 = {2 * sol.cost:14.4f}  "
+              f"log p = {lp:14.4f}")
+        if select == "logp":
+            if lp > best_lp:
+                best, best_lp = sol, lp
+        elif best is None or sol.cost < best.cost:
+            best = sol
+    if best is None:
+        raise RuntimeError("no least-squares start reached the prior support; widen the search")
+    try:
+        cov = np.linalg.inv(best.jac.T @ best.jac)
+        L = np.linalg.cholesky(0.5 * (cov + cov.T))
+    except np.linalg.LinAlgError:
+        cov, L = None, np.diag(1e-4 * width)
+    p0, draws = [], 0
+    while len(p0) < n_walkers:
+        draws += 1
+        if max_draws is not None and draws > max_draws:
+            L = np.diag(1e-4 * width)
+        th = best.x + L @ rng.standard_normal(best.x.size)
+        if np.isfinite(post(th)):
+            p0.append(th)
+    print(f"[Init] best fit: chi2 = {2 * best.cost:.4f} ({best.fun.size} observables, "
+          f"{best.x.size} parameters)")
+    return np.array(p0), best.x, cov
+
+
+def run_sampler(target, p0, n_steps, n_proc=1, progress=True):
+    """
+    emcee with differential-evolution moves (DEMove 0.8, DESnookerMove 0.2).
+
+    Parameters
+    ----------
+    target : callable
+        Log posterior (picklable if n_proc > 1).
+    p0 : ndarray, shape (n_walkers, ndim)
+        Walker starts.
+    n_steps : int
+    n_proc : int
+        > 1: multiprocessing pool of that size.
+    progress : bool
+        emcee progress bar.
+
+    Returns
+    -------
+    chain : ndarray, shape (n_steps, n_walkers, ndim)
+    logp : ndarray, shape (n_steps, n_walkers)
+    tau : ndarray, shape (ndim,)
+        Autocorrelation times (tol=0).
+    acceptance : float
+        Mean acceptance fraction.
+    """
+    n_walkers, ndim = p0.shape
+    moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
+    if n_proc > 1:
+        from multiprocessing import Pool
+
+        with Pool(n_proc) as pool:
+            sampler = emcee.EnsembleSampler(n_walkers, ndim, target, moves=moves, pool=pool)
+            sampler.run_mcmc(p0, n_steps, progress=progress)
+    else:
+        sampler = emcee.EnsembleSampler(n_walkers, ndim, target, moves=moves)
+        sampler.run_mcmc(p0, n_steps, progress=progress)
+    tau = sampler.get_autocorr_time(tol=0)
+    return (sampler.get_chain(), sampler.get_log_prob(), tau,
+            float(np.mean(sampler.acceptance_fraction)))
+
+
 def run_emcee(post, n_walkers, n_steps, rng, label, coords=None):
     """
     emcee with differential-evolution moves (DEMove 0.8, DESnookerMove 0.2).
@@ -836,13 +1372,9 @@ def run_emcee(post, n_walkers, n_steps, rng, label, coords=None):
     target = post if coords is None else coords
     if coords is not None:
         p0 = coords.to_phi(p0)
-    moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
-    sampler = emcee.EnsembleSampler(n_walkers, p0.shape[1], target, moves=moves)
-    sampler.run_mcmc(p0, n_steps, progress=False)
-    tau = sampler.get_autocorr_time(tol=0)
-    print(f"[MCMC] {label}: acceptance {np.mean(sampler.acceptance_fraction):.3f}, "
+    chain, logp, tau, acc = run_sampler(target, p0, n_steps, progress=False)
+    print(f"[MCMC] {label}: acceptance {acc:.3f}, "
           f"tau max {np.max(tau):.1f} ({n_steps / np.max(tau):.0f} tau)")
-    chain, logp = sampler.get_chain(), sampler.get_log_prob()
     if coords is not None:
         logp = logp - coords.log_jacobian(chain)
         chain = coords.to_theta(chain)
@@ -1038,6 +1570,113 @@ def plot_traces(chain, logp, burn, truth, name="fig_traces"):
     return MCMCPlots.save_figure(fig, name)
 
 
+def plot_trace_grid(chain, logp, burn, ref=None, ref_color=None, scale=None, name="fig_traces"):
+    """
+    Walker traces of every parameter and of log p on a 3-column grid (burn-in shaded).
+
+    Parameters
+    ----------
+    chain : ndarray, shape (n_step, n_walk, n_par)
+    logp : ndarray, shape (n_step, n_walk)
+    burn : int
+        Burn-in steps (shaded).
+    ref : ndarray, shape (n_par,), optional
+        Reference values (dashed), e.g. the truth or the least-squares fit.
+    ref_color : str, optional
+        Their colour (default MCMCPlots.C_TRUTH).
+    scale : ndarray, shape (n_par,), optional
+        Display scale of each parameter (e.g. MCMCPlots.PARAM_SCALE).
+    name : str
+        File name of the PDF.
+
+    Returns
+    -------
+    Path or None
+        The PDF written.
+    """
+    n_step, n_walk, n_par = chain.shape
+    s = np.ones(n_par) if scale is None else scale
+    ref_color = MCMCPlots.C_TRUTH if ref_color is None else ref_color
+    stride = max(1, n_step // 2000)
+    it = np.arange(0, n_step, stride)
+    ncol = 3
+    nrow = int(np.ceil((n_par + 1) / ncol))
+    fig, axs = plt.subplots(
+        nrow, ncol, figsize=(MCMCPlots.TXT_W, 1.15 * nrow), sharex=True, layout="constrained"
+    )
+    axs = axs.ravel()
+    series = [chain[..., i] * s[i] for i in range(n_par)] + [logp]
+    labels = [MCMCPlots.param_label(i) for i in range(n_par)] + [r"$\log p$"]
+    for i, (ax, y) in enumerate(zip(axs, series)):
+        ax.axvspan(0, burn, color=MCMCPlots.C_SPAN, lw=0, zorder=0)
+        ax.plot(it, y[it], color=MCMCPlots.C_POST, lw=0.3, alpha=0.25, rasterized=True)
+        if i < n_par:
+            if ref is not None:
+                ax.axhline(ref[i] * s[i], color=ref_color, ls="--", lw=0.8)
+        else:
+            post = y[burn:]
+            lo = np.percentile(post, 0.5) - 3.0 * np.std(post)
+            ax.set_ylim(lo, post.max() + 0.2 * (post.max() - lo))
+        ax.set_ylabel(labels[i])
+    for ax in axs[n_par + 1 :]:
+        ax.set_visible(False)
+    for ax in axs[max(0, n_par + 1 - ncol) : n_par + 1]:
+        ax.set_xlabel("Step")
+        ax.tick_params(labelbottom=True)
+    return MCMCPlots.save_figure(fig, name)
+
+
+def plot_residual_band(model, post, names, refs=(), keep=None, name="fig_residuals", n_draw=300):
+    """
+    Normalized residuals of every observable: posterior predictive band (median, 95 %) and
+    reference solutions (+/-3 sigma shaded; symlog scale beyond 10 sigma).
+
+    Parameters
+    ----------
+    model : object
+        With residuals(theta) (normalized residuals).
+    post : ndarray, shape (N, ndim)
+        Posterior samples.
+    names : list of str
+        Observable labels (residuals order).
+    refs : iterable of (theta, marker, ms, color, label)
+        Reference solutions (e.g. least squares, homogeneous body).
+    keep : ndarray of bool, optional
+        Observables to show (default all).
+    name : str
+    n_draw : int
+        Posterior draws for the predictive band.
+
+    Returns
+    -------
+    Path or None
+    """
+    keep = np.ones(len(names), dtype=bool) if keep is None else np.asarray(keep, dtype=bool)
+    rng = np.random.default_rng(2)
+    draws = post[rng.choice(len(post), size=min(n_draw, len(post)), replace=False)]
+    R = np.array([model.residuals(th) for th in draws])[:, keep]
+    names = [nm for nm, k_ in zip(names, keep) if k_]
+    k = np.arange(len(names))
+    lo, med, hi = np.percentile(R, [2.5, 50, 97.5], axis=0)
+    fig, ax = plt.subplots(figsize=(MCMCPlots.TXT_W, 2.4), layout="constrained")
+    ax.axhspan(-3, 3, color=MCMCPlots.C_SPAN, lw=0, zorder=0)
+    ax.vlines(k, lo, hi, color=MCMCPlots.C_POST, lw=1.6, alpha=0.5)
+    ax.plot(k, med, "o", ms=2.4, color=MCMCPlots.C_POST, label=r"MCMC Posterior (median, 95$\%$)")
+    r_max = max(np.abs(lo).max(), np.abs(hi).max())
+    for theta, marker, ms, color, label in refs:
+        r = model.residuals(theta)[keep]
+        r_max = max(r_max, np.abs(r).max())
+        ax.plot(k, r, marker, ls="", ms=ms, mew=0.8, color=color, label=label)
+    if r_max > 10.0:
+        ax.set_yscale("symlog", linthresh=3.0)
+    fs = 6 if len(k) <= 60 else 4
+    ax.set_xticks(k, names, rotation=90, fontsize=fs)
+    ax.set_xlim(-0.7, k[-1] + 0.7)
+    ax.set_ylabel(r"(Observed $-$ Model) / $\sigma$")
+    fig.legend(loc="outside upper center", ncol=1 + len(refs))
+    return MCMCPlots.save_figure(fig, name)
+
+
 def plot_core_sections(shape, model, post, truth, surface_label, name="fig_core_sections", n_draw=80):
     """
     Outer shape and core boundaries in the x-z (meridional) and x-y (equatorial) planes of
@@ -1082,8 +1721,48 @@ def plot_core_sections(shape, model, post, truth, surface_label, name="fig_core_
 
 
 # ============================================================
-# Summary
+# Outputs
 # ============================================================
+
+
+def results_dir(script_file):
+    """
+    Create results/<script name>_<YYMMDDHHMMSS>/ next to the script and make it the figure
+    directory of MCMCPlots.
+
+    Parameters
+    ----------
+    script_file : str or Path
+        __file__ of the calling script.
+
+    Returns
+    -------
+    Path
+    """
+    script = Path(script_file).resolve()
+    return MCMCPlots.set_figure_dir(
+        script.parent / "results" / (script.stem + "_" + datetime.now().strftime("%y%m%d%H%M%S"))
+    )
+
+
+def write_npz(path, **arrays):
+    """Compressed .npz of the arrays (np.savez_compressed), written with MCMCPlots.write_output."""
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    return MCMCPlots.write_output(path, buf.getvalue(), tag="Chain")
+
+
+def write_text(path, lines):
+    """Print the lines and write them to path (MCMCPlots.write_output)."""
+    text = "\n".join(lines) + "\n"
+    print(text)
+    return MCMCPlots.write_output(path, text.encode(), tag="Summary")
+
+
+def quantiles(x):
+    """Median and 16-84 % half-widths of samples: (median, median - q16, q84 - median)."""
+    q16, q50, q84 = np.percentile(x, [16, 50, 84])
+    return q50, q50 - q16, q84 - q50
 
 
 def summary_row(name, ref, ours, fmt="{:.4f}"):

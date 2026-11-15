@@ -2,8 +2,9 @@ r"""
 Interior density of an asteroid from its spherical-harmonic gravity field, by density
 regions (or mascons) and MCMC (emcee).
 
-No orbit propagation, no MCMCModel. The OBJ loader, solid harmonics, Gauss rules and mesh
-cuts come from Interior.py; the figures reuse the house style of MCMCPlots.py (configure,
+No orbit propagation, no MCMCModel. The OBJ loader, solid harmonics, tetrahedron quadrature,
+SH orderings, walker starts, sampler, trace/residual figures and output files come from
+Interior.py; the figures reuse the house style of MCMCPlots.py (configure,
 plot_corner, save_figure, write_output).
 
 Model
@@ -62,22 +63,40 @@ the body, normalized residuals.
 
 from __future__ import annotations
 
-import io
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
-import emcee
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import least_squares
 from scipy.stats import uniform
 
 import MCMCPlots
-from Interior import fmt, gauss01, load_shape, mesh_section, solid_harmonics
+from Interior import (
+    cs_names,
+    face_tetrahedra,
+    flat_posterior,
+    flatten_cs,
+    fmt,
+    fully_normalized_legendre,
+    load_shape,
+    mesh_section,
+    mesh_volume,
+    multistart_walkers,
+    plot_residual_band,
+    plot_trace_grid,
+    quantiles,
+    results_dir,
+    run_sampler,
+    sh_terms,
+    solid_harmonics,
+    tetra_gauss,
+    tetra_points,
+    write_npz,
+    write_text,
+)
 
 MCMCPlots.SHOW_FIGS = True  # plt.show() after each figure is saved
 
@@ -142,31 +161,6 @@ REGION_SYM = [r"\mathrm{c}", r"\mathrm{e}_1", r"\mathrm{e}_2", r"\mathrm{e}_3", 
               r"\mathrm{N}", r"\mathrm{S}"]
 STRATEGIC_NAMES = ["centre", "+long", "-long", "+mid", "-mid", "+pole", "-pole"]
 STRATEGIC_SYM = [r"\mathrm{c}", r"+a", r"-a", r"+b", r"-b", r"+c", r"-c"]
-
-
-# ============================================================
-# Mesh volume
-# ============================================================
-
-
-def signed_volume_of_mesh(V: np.ndarray, T: np.ndarray) -> float:
-    """
-    Signed volume of a closed triangle mesh (sum of origin-apex tetrahedra).
-
-    Parameters
-    ----------
-    V : ndarray, shape (n_v, 3)
-    T : ndarray of int, shape (n_t, 3)
-
-    Returns
-    -------
-    float
-        Volume, positive for outward-oriented triangles.
-    """
-    v0 = V[T[:, 0]]
-    v1 = V[T[:, 1]]
-    v2 = V[T[:, 2]]
-    return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
 
 
 # ============================================================
@@ -684,7 +678,7 @@ def build_strategic_big_mascons(
         mesh = trimesh.Trimesh(vertices=V, faces=T, process=False)
         Vmesh = float(mesh.volume)
     else:
-        Vmesh = abs(signed_volume_of_mesh(V, T))
+        Vmesh = abs(mesh_volume(V, T))
     vol_i = Vmesh / float(K)
 
     # each mascon is its own "layer", so one rho per mascon is estimated
@@ -698,53 +692,8 @@ def build_strategic_big_mascons(
 
 
 # ============================================================
-# Fully normalized Legendre + mascons -> Cbar / Sbar
+# Mascons -> Cbar / Sbar
 # ============================================================
-
-
-def fully_normalized_legendre(nmax: int, x: float) -> np.ndarray:
-    """
-    Fully normalized associated Legendre functions Pbar_nm(x), x = sin(latitude).
-
-    Normalization: the integral of Pbar_nm^2 [cos^2, sin^2](m lam) over the unit sphere is
-    4 pi, so Pbar_10 = sqrt(3) x and Pbar_11 = sqrt(3) sqrt(1 - x^2). Standard
-    sectoral / subdiagonal / column recursions.
-
-    Parameters
-    ----------
-    nmax : int
-        Maximum degree.
-    x : float
-        sin(latitude), in [-1, 1].
-
-    Returns
-    -------
-    ndarray, shape (nmax + 1, nmax + 1)
-        P[n, m] (zero for m > n).
-    """
-    P = np.zeros((nmax + 1, nmax + 1), dtype=float)
-    P[0, 0] = 1.0
-    if nmax == 0:
-        return P
-
-    sx = math.sqrt(max(0.0, 1.0 - x * x))
-    for m in range(1, nmax + 1):
-        # Pbar_11 = sqrt(3) cos(phi); for m >= 2 the delta_m0 normalization factor is constant
-        f = math.sqrt(3.0) if m == 1 else math.sqrt((2.0 * m + 1.0) / (2.0 * m))
-        P[m, m] = f * sx * P[m - 1, m - 1]
-
-    for m in range(0, nmax):
-        P[m + 1, m] = math.sqrt(2.0 * m + 3.0) * x * P[m, m]
-
-    for m in range(0, nmax + 1):
-        for n in range(m + 2, nmax + 1):
-            a = math.sqrt(((2.0 * n + 1.0) * (2.0 * n - 1.0)) / ((n - m) * (n + m)))
-            b = math.sqrt(
-                ((2.0 * n + 1.0) * (n + m - 1.0) * (n - m - 1.0))
-                / ((2.0 * n - 3.0) * (n - m) * (n + m))
-            )
-            P[n, m] = a * x * P[n - 1, m] - b * P[n - 2, m]
-    return P
 
 
 def mascons_to_cs(
@@ -820,51 +769,6 @@ def mascons_to_cs(
     return C, S
 
 
-def flatten_cs(
-    C: np.ndarray, S: np.ndarray, n_degree: int, exclude_c00: bool = True
-) -> np.ndarray:
-    """
-    Stack the coefficients as [C_nm ..., S_nm ...] in (n, m) order, n = 0..n_degree, m = 0..n.
-
-    Parameters
-    ----------
-    C, S : ndarray, shape (>= n_degree + 1, >= n_degree + 1)
-    n_degree : int
-    exclude_c00 : bool
-        Skip (n, m) = (0, 0) in both blocks.
-
-    Returns
-    -------
-    ndarray, shape (2 n_terms,)
-    """
-    c_list, s_list = [], []
-    for n in range(0, n_degree + 1):
-        for m in range(0, n + 1):
-            if exclude_c00 and (n == 0 and m == 0):
-                continue
-            c_list.append(C[n, m])
-            s_list.append(S[n, m])
-    return np.array(c_list + s_list, dtype=float)
-
-
-def cs_names(n_degree: int, exclude_c00: bool = True) -> List[str]:
-    """
-    Labels of the entries of flatten_cs, e.g. 'C20', 'S22'.
-
-    Parameters
-    ----------
-    n_degree : int
-    exclude_c00 : bool
-
-    Returns
-    -------
-    list of str
-    """
-    nm = [(n, m) for n in range(n_degree + 1) for m in range(n + 1)
-          if not (exclude_c00 and n == 0 and m == 0)]
-    return [f"C{n}{m}" for n, m in nm] + [f"S{n}{m}" for n, m in nm]
-
-
 def build_mascon_design_matrix(
     mascons: List[Mascon], n_degree: int, ref_radius: float, exclude_c00: bool = True
 ) -> np.ndarray:
@@ -887,12 +791,7 @@ def build_mascon_design_matrix(
     mascons = list(mascons)
     Nmc = len(mascons)
 
-    n_terms = 0
-    for n in range(0, n_degree + 1):
-        for m in range(0, n + 1):
-            if exclude_c00 and (n == 0 and m == 0):
-                continue
-            n_terms += 1
+    n_terms = len(sh_terms(n_degree, exclude_c00))
 
     A = np.zeros((2 * n_terms, Nmc), dtype=float)
 
@@ -992,21 +891,16 @@ def region_design_matrix(V, T, n_deg, r_ref, r_core, belt_lat_deg, chunk=8000):
     volumes : ndarray, shape (7,)
         Region volumes [m^3].
     """
-    nm = [(n, m) for n in range(n_deg + 1) for m in range(n + 1) if (n, m) != (0, 0)]
+    nm = sh_terms(n_deg)
     K = 7
     A = np.zeros((2 * len(nm), K))
     volumes = np.zeros(K)
-    s, ws = gauss01((n_deg + 3) // 2)
-    q, wq = gauss01((n_deg + 2) // 2)
-    u, wu = gauss01((n_deg + 4) // 2)
+    (u, wu), (s, ws), (q, wq) = tetra_gauss(n_deg)
     SS, QQ = (g.ravel() for g in np.meshgrid(s, q, indexing="ij"))
     W_sq = 6.0 * np.outer(ws * s, wq).ravel()
     c0, c1, c2 = 1.0 - SS, SS * (1.0 - QQ), SS * QQ
-    for i in range(0, len(T), chunk):
-        v0, v1, v2 = (V[T[i : i + chunk, k]] for k in range(3))
-        vol = np.einsum("ij,ij->i", v0, np.cross(v1, v2)) / 6.0
-        P = (c0[None, :, None] * v0[:, None] + c1[None, :, None] * v1[:, None]
-             + c2[None, :, None] * v2[:, None]).reshape(-1, 3)
+    for v0, v1, v2, vol in face_tetrahedra(V, T, chunk):
+        P = tetra_points(c0, c1, c2, v0, v1, v2)
         w_p = (vol[:, None] * W_sq[None, :]).ravel()
         t_star = np.clip(r_core / np.linalg.norm(P, axis=1), 0.0, 1.0)
         lab_dir = region_labels(P, 0.0, belt_lat_deg)
@@ -1048,7 +942,7 @@ def cs_sigma(n_deg, r_ref, sigma_com, sigma_cs, sigma_model):
     -------
     ndarray, shape (n_cs,)
     """
-    deg = [n for n in range(n_deg + 1) for m in range(n + 1) if (n, m) != (0, 0)]
+    deg = [n for n, m in sh_terms(n_deg)]
     sig = [sigma_com / (math.sqrt(3.0) * r_ref) if n == 1 else math.hypot(sigma_cs[n], sigma_model)
            for n in deg]
     return np.array(sig + sig, dtype=float)
@@ -1245,115 +1139,9 @@ class DensityPosterior:
         return lp + self.log_like(rho)
 
 
-def initialize_walkers(post, n_walkers, n_starts, rng, max_draws=100_000):
-    """
-    Multi-start bounded least squares from prior draws, then walkers around the best fit.
-
-    Walkers are drawn from N(rho_lsq, cov), cov = (J^T J)^-1 at the best fit (a small
-    diagonal if J^T J is singular), and redrawn until they are inside the prior box.
-
-    Parameters
-    ----------
-    post : DensityPosterior
-    n_walkers : int
-    n_starts : int
-        Number of least-squares starts.
-    rng : numpy.random.Generator
-    max_draws : int
-        Draws before falling back to a small ball around the best fit.
-
-    Returns
-    -------
-    p0 : ndarray, shape (n_walkers, K)
-    rho_lsq : ndarray, shape (K,)
-        Best least-squares fit.
-    cov_lsq : ndarray, shape (K, K) or None
-        Its covariance (None if singular).
-    """
-    width = post.hi - post.lo
-    best = None
-    for k in range(n_starts):
-        x0 = post.lo + rng.random(post.ndim) * width
-        sol = least_squares(
-            post.residuals, x0, bounds=(post.lo, post.hi), x_scale=width, method="trf",
-            xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=400,
-        )
-        print(f"[Init] start {k + 1:2d}/{n_starts}: chi2 = {2 * sol.cost:14.4f}")
-        if best is None or sol.cost < best.cost:
-            best = sol
-    try:
-        cov = np.linalg.inv(best.jac.T @ best.jac)
-        L = np.linalg.cholesky(0.5 * (cov + cov.T))
-    except np.linalg.LinAlgError:
-        cov, L = None, np.diag(1e-4 * width)
-    p0, draws = [], 0
-    while len(p0) < n_walkers:
-        draws += 1
-        if draws > max_draws:
-            L = np.diag(1e-4 * width)
-        th = best.x + L @ rng.standard_normal(post.ndim)
-        if np.isfinite(post(th)):
-            p0.append(th)
-    print(f"[Init] best fit: chi2 = {2 * best.cost:.4f} ({best.fun.size} observables, "
-          f"{post.ndim} parameters)")
-    return np.array(p0), best.x, cov
-
-
 # ============================================================
 # Figures
 # ============================================================
-
-
-def plot_traces(chain, logp, burn, ref=None, name="fig_traces"):
-    """
-    Walker traces of every density and of log p (burn-in shaded).
-
-    Parameters
-    ----------
-    chain : ndarray, shape (n_step, n_walk, K)
-        Internal units (scaled by MCMCPlots.PARAM_SCALE for display).
-    logp : ndarray, shape (n_step, n_walk)
-    burn : int
-        Burn-in steps (shaded).
-    ref : ndarray, shape (K,), optional
-        Reference values (dashed), e.g. the least-squares fit.
-    name : str
-        File name of the PDF.
-
-    Returns
-    -------
-    Path or None
-        The PDF written.
-    """
-    n_step, n_walk, n_par = chain.shape
-    s = MCMCPlots.PARAM_SCALE
-    stride = max(1, n_step // 2000)
-    it = np.arange(0, n_step, stride)
-    ncol = 3
-    nrow = int(np.ceil((n_par + 1) / ncol))
-    fig, axs = plt.subplots(
-        nrow, ncol, figsize=(MCMCPlots.TXT_W, 1.15 * nrow), sharex=True, layout="constrained"
-    )
-    axs = axs.ravel()
-    series = [chain[..., i] * s[i] for i in range(n_par)] + [logp]
-    labels = [MCMCPlots.param_label(i) for i in range(n_par)] + [r"$\log p$"]
-    for i, (ax, y) in enumerate(zip(axs, series)):
-        ax.axvspan(0, burn, color=MCMCPlots.C_SPAN, lw=0, zorder=0)
-        ax.plot(it, y[it], color=MCMCPlots.C_POST, lw=0.3, alpha=0.25, rasterized=True)
-        if i < n_par:
-            if ref is not None:
-                ax.axhline(ref[i] * s[i], color=MCMCPlots.C_BATCH, ls="--", lw=0.8)
-        else:
-            post = y[burn:]
-            lo = np.percentile(post, 0.5) - 3.0 * np.std(post)
-            ax.set_ylim(lo, post.max() + 0.2 * (post.max() - lo))
-        ax.set_ylabel(labels[i])
-    for ax in axs[n_par + 1 :]:
-        ax.set_visible(False)
-    for ax in axs[max(0, n_par + 1 - ncol) : n_par + 1]:
-        ax.set_xlabel("Step")
-        ax.tick_params(labelbottom=True)
-    return MCMCPlots.save_figure(fig, name)
 
 
 def plot_densities(post, rho_lsq, cov_lsq, rho_bulk, lo, hi, name="fig_densities"):
@@ -1621,54 +1409,6 @@ def plot_region_sections(V, T, rho_med, com, r_core, belt_lat_deg, name="fig_den
     return MCMCPlots.save_figure(fig, name)
 
 
-def plot_residuals(post_model, post, rho_lsq, rho_hom, names, name="fig_residuals", n_draw=300):
-    """
-    Normalized residuals of every observable: posterior predictive band, least squares and
-    homogeneous body (+/-3 sigma shaded; symlog scale beyond 10 sigma).
-
-    Parameters
-    ----------
-    post_model : DensityPosterior
-    post : ndarray, shape (N, K)
-        Posterior samples.
-    rho_lsq, rho_hom : ndarray, shape (K,)
-        Least-squares fit and homogeneous body.
-    names : list of str
-        Observable names (DensityPosterior.residuals order).
-    name : str
-    n_draw : int
-        Posterior draws for the predictive band.
-
-    Returns
-    -------
-    Path or None
-    """
-    keep = np.array([not (nm.startswith("S") and nm.endswith("0") and len(nm) == 3)
-                     for nm in names])  # S_n0 == 0 identically
-    rng = np.random.default_rng(2)
-    draws = post[rng.choice(len(post), size=min(n_draw, len(post)), replace=False)]
-    R = np.array([post_model.residuals(th) for th in draws])[:, keep]
-    r_lsq = post_model.residuals(rho_lsq)[keep]
-    r_hom = post_model.residuals(rho_hom)[keep]
-    names = [nm for nm, k_ in zip(names, keep) if k_]
-    k = np.arange(len(names))
-    lo, med, hi = np.percentile(R, [2.5, 50, 97.5], axis=0)
-    fig, ax = plt.subplots(figsize=(MCMCPlots.TXT_W, 2.4), layout="constrained")
-    ax.axhspan(-3, 3, color=MCMCPlots.C_SPAN, lw=0, zorder=0)
-    ax.vlines(k, lo, hi, color=MCMCPlots.C_POST, lw=1.6, alpha=0.5)
-    ax.plot(k, med, "o", ms=2.4, color=MCMCPlots.C_POST, label=r"MCMC Posterior (median, 95$\%$)")
-    ax.plot(k, r_lsq, "+", ms=3.5, mew=0.8, color=MCMCPlots.C_SC, label="Batch Least Squares")
-    ax.plot(k, r_hom, "x", ms=3.0, mew=0.8, color=MCMCPlots.C_BATCH, label="Equal Densities (Bulk)")
-    if max(np.abs(lo).max(), np.abs(hi).max(), np.abs(r_hom).max()) > 10.0:
-        ax.set_yscale("symlog", linthresh=3.0)
-    fs = 6 if len(k) <= 60 else 4
-    ax.set_xticks(k, names, rotation=90, fontsize=fs)
-    ax.set_xlim(-0.7, k[-1] + 0.7)
-    ax.set_ylabel(r"(Observed $-$ Model) / $\sigma$")
-    fig.legend(loc="outside upper center", ncol=3)
-    return MCMCPlots.save_figure(fig, name)
-
-
 def write_summary(path, post, rho_lsq, cov_lsq, rho_hom, par_names, extra_lines):
     """
     Text table of the densities: posterior median and 16-84 % half-widths, least squares,
@@ -1692,12 +1432,10 @@ def write_summary(path, post, rho_lsq, cov_lsq, rho_hom, par_names, extra_lines)
                                  f"{'group':>12s} {'median':>12s} {'-1sig':>12s} {'+1sig':>12s} "
                                  f"{'LSQ':>12s} {'LSQ 1sig':>12s} {'homogeneous':>12s}"]
     for k, nm in enumerate(par_names):
-        q16, q50, q84 = np.percentile(post[:, k], [16, 50, 84])
-        lines.append(f"{nm:>12s} {fmt(q50)} {fmt(q50 - q16)} {fmt(q84 - q50)} "
+        q50, dlo, dhi = quantiles(post[:, k])
+        lines.append(f"{nm:>12s} {fmt(q50)} {fmt(dlo)} {fmt(dhi)} "
                      f"{fmt(rho_lsq[k])} {fmt(sig[k])} {fmt(rho_hom[k])}")
-    text = "\n".join(lines) + "\n"
-    print(text)
-    MCMCPlots.write_output(path, text.encode(), tag="Summary")
+    write_text(path, lines)
 
 
 # ============================================================
@@ -1709,7 +1447,7 @@ if __name__ == "__main__":
 
     # --- shape ---
     V, T = load_shape(SHAPE_OBJ, SHAPE_UNIT)
-    vol = abs(signed_volume_of_mesh(V, T))
+    vol = abs(mesh_volume(V, T))
     print(f"[Shape] {SHAPE_OBJ.name}: {len(V)} vertices, {len(T)} faces, volume {vol:.6e} m^3")
 
     # --- observed field ---
@@ -1792,9 +1530,7 @@ if __name__ == "__main__":
         model(rho_hom)
     print(f"[Model] log posterior: {(time.time() - t0) / 500 * 1e6:.1f} us per call")
 
-    fig_dir = MCMCPlots.set_figure_dir(
-        HERE / "results" / (Path(__file__).stem + "_" + datetime.now().strftime("%y%m%d%H%M%S"))
-    )
+    fig_dir = results_dir(__file__)
 
     # --- sampling ---
     rng = np.random.default_rng()
@@ -1804,23 +1540,13 @@ if __name__ == "__main__":
         cov_lsq = saved["cov_lsq"] if saved["cov_lsq"].ndim == 2 else None
         print(f"[MCMC] loaded {LOAD_CHAIN}: chain {chain.shape}")
     else:
-        p0, rho_lsq, cov_lsq = initialize_walkers(model, N_WALKERS, N_STARTS, rng)
-        moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
-        if N_PROC > 1:
-            from multiprocessing import Pool
-
-            with Pool(N_PROC) as pool:
-                sampler = emcee.EnsembleSampler(N_WALKERS, K, model, moves=moves, pool=pool)
-                sampler.run_mcmc(p0, N_STEPS, progress=True)
-        else:
-            sampler = emcee.EnsembleSampler(N_WALKERS, K, model, moves=moves)
-            sampler.run_mcmc(p0, N_STEPS, progress=True)
-        chain, logp = sampler.get_chain(), sampler.get_log_prob()
-        tau = sampler.get_autocorr_time(tol=0)
-        print(f"[MCMC] acceptance {np.mean(sampler.acceptance_fraction):.3f}")
-        buf = io.BytesIO()
-        np.savez_compressed(
-            buf, chain=chain, log_prob=logp, tau=tau, rho_lsq=rho_lsq,
+        starts = [lo + rng.random(K) * (hi - lo) for _ in range(N_STARTS)]
+        p0, rho_lsq, cov_lsq = multistart_walkers(model, starts, N_WALKERS, rng, lo, hi,
+                                                  max_draws=100_000)
+        chain, logp, tau, acc = run_sampler(model, p0, N_STEPS, n_proc=N_PROC)
+        print(f"[MCMC] acceptance {acc:.3f}")
+        write_npz(
+            fig_dir / "chain.npz", chain=chain, log_prob=logp, tau=tau, rho_lsq=rho_lsq,
             cov_lsq=np.array(np.nan) if cov_lsq is None else cov_lsq,
             pos=pos, volumes=volumes, layers=layers, mascon_mode=mode, A=A,
             core_radius=r_core, belt_lat_deg=belt_lat,
@@ -1829,14 +1555,8 @@ if __name__ == "__main__":
             n_deg=N_DEG, r_ref=R_REF,
             shape=str(SHAPE_OBJ.name), shape_unit=SHAPE_UNIT, rho_lo=RHO_LO, rho_hi=RHO_HI,
         )
-        MCMCPlots.write_output(fig_dir / "chain.npz", buf.getvalue(), tag="Chain")
 
-    burn = int(5 * np.max(tau)) if BURN_IN is None else int(BURN_IN)
-    thin = max(1, int(0.5 * np.min(tau))) if THIN is None else int(THIN)
-    if burn >= chain.shape[0]:
-        print(f"[MCMC] WARNING: burn-in {burn} >= {chain.shape[0]} steps; using half the chain")
-        burn = chain.shape[0] // 2
-    post = chain[burn::thin].reshape(-1, K)
+    post, burn, thin = flat_posterior(chain, tau, BURN_IN, THIN)
     print(f"[MCMC] tau = {np.array2string(tau, precision=1)}; burn-in {burn}, thin {thin}, "
           f"{len(post)} samples ({chain.shape[0] / np.max(tau):.0f} tau)")
 
@@ -1852,7 +1572,8 @@ if __name__ == "__main__":
     if cov_lsq is not None and np.any(np.sqrt(np.abs(np.diag(cov_lsq))) > RHO_HI - RHO_LO):
         cov_plot = None
         print("[Plot] least-squares covariance wider than the prior box: not drawn")
-    plot_traces(chain, logp, burn, ref=rho_lsq)
+    plot_trace_grid(chain, logp, burn, ref=rho_lsq, ref_color=MCMCPlots.C_BATCH,
+                    scale=MCMCPlots.PARAM_SCALE)
     MCMCPlots.plot_corner(post, batch_mean=rho_lsq, batch_cov=cov_plot, name="fig_corner")
     MCMCPlots.plot_corner(post, batch_mean=rho_lsq, batch_cov=cov_plot, prior=prior,
                           name="fig_corner_prior")
@@ -1861,7 +1582,12 @@ if __name__ == "__main__":
         plot_region_sections(V, T, rho_med, com, r_core, belt_lat)
     else:
         plot_density_sections(V, T, pos, layers, rho_med, com)
-    plot_residuals(model, post, rho_lsq, rho_hom, names)
+    keep = [not (nm.startswith("S") and nm.endswith("0") and len(nm) == 3)
+            for nm in names]  # S_n0 == 0 identically
+    plot_residual_band(model, post, names, keep=keep, refs=[
+        (rho_lsq, "+", 3.5, MCMCPlots.C_SC, "Batch Least Squares"),
+        (rho_hom, "x", 3.0, MCMCPlots.C_BATCH, "Equal Densities (Bulk)"),
+    ])
 
     chi2_med = float(np.sum(model.residuals(rho_med) ** 2))
     write_summary(

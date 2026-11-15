@@ -55,9 +55,7 @@ of inertia marginals, moment corner (a), traces and corners (b), core cross-sect
 
 from __future__ import annotations
 
-import io
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -65,26 +63,29 @@ import numpy as np
 import MCMCPlots
 from Interior import (
     AngularGrid,
-    LogCoreCoordinates,
-    MomentsPosterior,
-    SHShape,
-    SolarPrecession,
-    TwoLayer,
-    TwoLayerPosterior,
     ci_string,
     endmember_map,
     flat_posterior,
     inertia_quantities,
+    LogCoreCoordinates,
     masked_extreme,
     moment_grid_H_range,
+    MomentsPosterior,
     plot_core_sections,
     plot_endmembers,
     plot_mean_moment,
     plot_sigma_I,
     plot_traces,
+    results_dir,
     run_emcee,
+    SHShape,
+    SolarPrecession,
     summary_row,
+    TwoLayer,
+    TwoLayerPosterior,
     with_mean_moment,
+    write_npz,
+    write_text,
 )
 
 MCMCPlots.SHOW_FIGS = True  # plt.show() after each figure is saved
@@ -238,9 +239,7 @@ if __name__ == "__main__":
     obs_B, sig_B = observe(SIGMA_H_REL, SIGMA_MODEL_REL)
     post_B_model = TwoLayerPosterior(model, obs_B, sig_B, PRIOR_B_LO, PRIOR_B_HI, RHO1_MIN)
 
-    fig_dir = MCMCPlots.set_figure_dir(
-        HERE / "results" / (Path(__file__).stem + "_" + datetime.now().strftime("%y%m%d%H%M%S"))
-    )
+    fig_dir = results_dir(__file__)
 
     # --- 3-4. sampling ---
     sweep = list(SIGMA_H_SWEEP) + [None]  # None: no H
@@ -261,16 +260,14 @@ if __name__ == "__main__":
             taus_A.append(tau)
         chain_B, logp_B, tau_B, map_B = run_emcee(post_B_model, N_WALKERS, N_STEPS_B, rng, "(b) two-layer",
                                                    coords=LogCoreCoordinates(post_B_model, RHO_MEAN))
-        buf = io.BytesIO()
-        np.savez_compressed(
-            buf, chains_A=np.array(chains_A, dtype=object), taus_A=np.array(taus_A, dtype=object),
+        write_npz(
+            fig_dir / "chain.npz", chains_A=np.array(chains_A, dtype=object), taus_A=np.array(taus_A, dtype=object),
             sweep=np.array(sweep, dtype=object), chain_B=chain_B.astype(np.float32),
             logp_B=logp_B.astype(np.float32), tau_B=tau_B, map_B=map_B, truth=TRUTH,
             obs_B=np.array(obs_B, dtype=object), sig_B=np.array(sig_B, dtype=object), noise=z,
             prior_A=np.array([lo_A, hi_A]), prior_B=np.array([PRIOR_B_LO, PRIOR_B_HI]),
             shape=SHAPE_SH.name, n_mu=N_MU, n_phi=N_PHI, rho_mean=RHO_MEAN, rho1_min=RHO1_MIN,
         )
-        MCMCPlots.write_output(fig_dir / "chain.npz", buf.getvalue(), tag="Chain")
 
     # --- posteriors (a) ---
     flat_A = [with_mean_moment(flat_posterior(ch.astype(float), tau, BURN_IN, THIN)[0])
@@ -414,7 +411,5 @@ if __name__ == "__main__":
         f"{100 * SIGMA_H_REL:.1f} % <-> {SIGMA_H_REL * prec['rate']:.1f} mas/yr on "
         f"{prec['rate']:.1f} mas/yr",
     ]
-    text = "\n".join(lines) + "\n"
-    print(text)
-    MCMCPlots.write_output(fig_dir / "summary.txt", text.encode(), tag="Summary")
+    write_text(fig_dir / "summary.txt", lines)
     print(f"[Done] {time.time() - t_start:.0f} s; outputs in {fig_dir}")
