@@ -1,0 +1,70 @@
+269 Justitia moments of inertia (analysis of Ermakov 2026, PSJ 7:170): get_interior_inertia_justitia.py
+Shape justitia_shape.obj: 574 vertices, 1144 faces, recentred by 0.000 km; quadrature 64 x 128; R0 = 25 km; mean density 1500 kg/m^3 (assumed)
+V = 6.55288e+13 m^3, R_v = 25.010 km, r_min = 19.02 km, r_max = 31.31 km
+
+1. Homogeneous body (reference: exact polyhedron integrals)
+  Quantity                                                Reference            This script
+  volume [m^3]                                          6.55284e+13            6.55288e+13
+  A_bar                                                      0.3545      0.3545 (+0.002 %)
+  B_bar                                                      0.4167      0.4167 (-0.002 %)
+  C_bar                                                      0.5074      0.5074 (+0.000 %)
+  J2                                                         0.1218      0.1218 (+0.002 %)
+  C22                                                        0.0156      0.0156 (-0.029 %)
+  H                                                          0.2401      0.2401 (+0.002 %)
+  I_bar                                                      0.4262      0.4262 (+0.000 %)
+  spin axis (body z) vs C axis [deg]             0 (principal-axis rotation)                  10.05
+   a relaxed rotator spins about C: the offset measures the inconsistency of the shape (lightcurve
+   + occultation model), the IAU pole and uniform density; a rendezvous gravity field and pole fix it
+
+2. Two-layer endmembers (as Ermakov 2026, Sec. 4.1, Fig. 2)
+  Quantity                                                Reference            This script
+  r_min, core exposure onset [km]                                 -                  19.02
+  (A) H range, rho1 >= 500                                        -        0.1226 - 0.2401
+  (A) min I_bar, rho2 <= 5000                                     -                 0.2437
+  (A) min I_bar, rho2 <= 3500                                     -                 0.2732
+  (A) min I_bar at r2 [km], rho2 [kg/m^3]                         -             15.2, 4867
+  (B) H change vs homogeneous                             0 (exact)            max 1.7e-12
+  (B) min J2                                          < homogeneous                 0.0715
+  (B) min I_bar                                                   -                 0.2500
+  H range, A, B, C at 75-110 % (C largest)                        -          0.018 - 0.482
+
+3. MCMC (a): theta = (A_bar, B_bar, C_bar), prior 75-110 % of homogeneous
+   data J2, C22 (sigma/value 0.100 %) + H; truth = two-layer TRUTH; 32 walkers x 6000 steps
+  sigma_H/H                I_bar (16-50-84 %)   sigma_I MCMC     Eq. 13
+  0.5 %                0.3793 +0.0023 -0.0023         0.0023     0.0022
+  1.0 %                0.3838 +0.0046 -0.0045         0.0046     0.0044
+  2.0 %                0.3928 +0.0097 -0.0092         0.0096     0.0089
+  3.0 %                0.4029 +0.0152 -0.0142         0.0148     0.0133
+  5.0 %                0.4182 +0.0199 -0.0224         0.0198     0.0222
+  10.0 %               0.4233 +0.0191 -0.0308         0.0243     0.0445
+  no H                 0.3897 +0.0413 -0.0420         0.0356          -
+  prior only: I_bar 0.3968 +0.0276 -0.0300, sigma 0.0271
+  requirement sigma_I = 0.01                                 Eq. 13               MCMC (a)
+  sigma_H/H, C_bar 75 % of homogeneous                       2.63 %                      -
+  sigma_H/H, C_bar homogeneous                               1.97 %                      -
+  sigma_H/H, C_bar 110 % of homogeneous                      1.79 %                      -
+  sigma_H/H, truth C_bar                                     2.25 %                 2.08 %
+
+4. MCMC (b): theta = (r2 [km], rho2 [kg/m^3], w); prior [2.0, 1500.0, 0.0] - [25.0, 3500.0, 1.0], rho1 >= 500
+   data J2, C22 (sigma 0.141 %, model floor 0.10 %), H (sigma 2.0 %); 32 walkers x 30000 steps in (ln r2, ln(rho2 - rho_mean), w), burn-in 742, thin 36, tau max 148.5
+                    truth             posterior (16-50-84 %)                 prior (16-50-84 %)
+  r2              15.0000            15.8013 +2.0497 -2.0712            11.1139 +6.2698 -6.2300
+  rho2          2500.0000      2253.9640 +522.6935 -312.2129      2411.9868 +741.5750 -657.4053
+  w                0.5000             0.2375 +0.1637 -0.1062             0.5029 +0.3346 -0.3407
+  I_bar            0.3753             0.3817 +0.0076 -0.0068             0.4121 +0.0129 -0.0477
+  C_bar            0.4445             0.4508 +0.0077 -0.0069             0.4901 +0.0159 -0.0608
+  H                0.2334             0.2299 +0.0035 -0.0039             0.2395 +0.0006 -0.0100
+  J2               0.1038             0.1036 +0.0001 -0.0001             0.1172 +0.0042 -0.0193
+  rho1          1228.3076        1252.0065 +10.2588 -14.8074       1435.1375 +60.2009 -336.9635
+  r_c             14.9513            15.7723 +2.0499 -2.0931            11.0889 +6.2543 -6.2189
+
+5. Precession (Ermakov 2026, Eq. 1), homogeneous body
+   pole RA 85.0691, Dec -57.8523 deg, spin 260.797885 deg/day (P = 33.13 h); orbit a 2.6145 AU, e 0.2164, i 5.4778 deg, node 156.4409 deg (osculating, 2034-01-01)
+  obliquity [deg]                                                 -                 165.54
+  precession period [My]                                          -                  0.013
+  d alpha / dt [mas/yr]                                           -                46504.4
+  d delta / dt [mas/yr]                                           -                 6689.9
+  pole drift rate [mas/yr]                                        -                25633.5
+  pole drift rate, MCMC (b) H [mas/yr]                            -      24546.6 +/- 372.9
+   the pole drift rate is proportional to H: sigma_H / H = 2.0 % <-> 512.7 mas/yr; sigma_I = 0.01 (C_bar homogeneous) needs sigma_H / H = 1.97 % <-> 505.2 mas/yr
+   (5052 mas = 0.61 m on the surface over a 10-yr baseline)
