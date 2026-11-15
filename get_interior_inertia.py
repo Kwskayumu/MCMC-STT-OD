@@ -2,8 +2,9 @@ r"""
 Interior of a two-shape asteroid (polyhedral mantle + ellipsoidal core) from its
 spherical-harmonic gravity field and its rotation state, by MCMC (emcee).
 
-Standalone: no orbit propagation, no MCMCModel. Only the figures reuse the house style of
-MCMCPlots.py (configure, plot_corner, save_figure, write_output).
+No orbit propagation, no MCMCModel. The OBJ loader, solid harmonics, Gauss rules and mesh
+cuts come from Interior.py; the figures reuse the house style of MCMCPlots.py (configure,
+plot_corner, save_figure, write_output).
 
 Model ("two shapes")
 --------------------
@@ -65,6 +66,7 @@ from matplotlib.patches import Ellipse
 from scipy.optimize import least_squares
 
 import MCMCPlots
+from Interior import fmt, gauss01, load_shape, mesh_section, solid_harmonics
 
 MCMCPlots.SHOW_FIGS = True  # plt.show() after each figure is saved
 
@@ -145,42 +147,6 @@ DERIVED_UNIT = ["", "", "", "m", "m", "m", ""]
 # ============================================================
 
 
-def load_shape(path, unit=1.0):
-    """
-    Read a Wavefront OBJ as a closed triangle mesh with outward normals.
-
-    Parameters
-    ----------
-    path : str or Path
-        OBJ file ('v' and 'f' records; polygons are fan-triangulated).
-    unit : float
-        Factor from the OBJ length unit to metres.
-
-    Returns
-    -------
-    V : ndarray, shape (n_v, 3)
-        Vertices [m].
-    T : ndarray of int, shape (n_t, 3)
-        Triangles, oriented so that the signed volume is positive.
-    """
-    verts, tris = [], []
-    with open(path) as f:
-        for line in f:
-            if line.startswith("v "):
-                verts.append([float(p) for p in line.split()[1:4]])
-            elif line.startswith("f "):
-                idx = []
-                for p in line.split()[1:]:
-                    k = int(p.split("/")[0])
-                    idx.append(k - 1 if k > 0 else len(verts) + k)
-                tris += [[idx[0], idx[i], idx[i + 1]] for i in range(1, len(idx) - 1)]
-    V = np.asarray(verts, dtype=float) * unit
-    T = np.asarray(tris, dtype=int)
-    if np.einsum("ij,ij->i", V[T[:, 0]], np.cross(V[T[:, 1]], V[T[:, 2]])).sum() < 0.0:
-        T = T[:, [0, 2, 1]]
-    return V, T
-
-
 class RadialLimit:
     """
     Inner radius of the outer surface as a function of direction from the shape origin.
@@ -253,61 +219,6 @@ def fibonacci_sphere(n):
 # ============================================================
 
 
-def solid_harmonics(X, n_max, r_ref):
-    r"""
-    Fully normalized solid harmonics at points X.
-
-    V_nm = (r/R)^n Pbar_nm(sin phi) [cos m lambda, sin m lambda], evaluated with Cartesian
-    recursions (polynomials in x/R, y/R, z/R; no division by r, so r = 0 is fine).
-    Pbar_nm carries sqrt((2 - delta_m0)(2n + 1)(n - m)!/(n + m)!), no Condon-Shortley phase,
-    so that for a body of mass M
-
-        Cbar_nm + i Sbar_nm = 1 / ((2n + 1) M) * int V_nm dm.
-
-    Parameters
-    ----------
-    X : ndarray, shape (Q, 3)
-        Points [m].
-    n_max : int
-        Maximum degree.
-    r_ref : float
-        Reference radius [m].
-
-    Returns
-    -------
-    Vc, Vs : ndarray, shape (n_max + 1, n_max + 1, Q)
-        Cosine and sine parts (lower triangle n >= m filled, the rest zero).
-    """
-    x, y, z = (np.asarray(X, dtype=float) / r_ref).T
-    r2 = x * x + y * y + z * z
-    Vc = np.zeros((n_max + 1, n_max + 1, x.size))
-    Vs = np.zeros_like(Vc)
-    Vc[0, 0] = 1.0
-    for m in range(1, n_max + 1):  # sectoral
-        f = math.sqrt(3.0) if m == 1 else math.sqrt((2 * m + 1) / (2 * m))
-        Vc[m, m] = f * (x * Vc[m - 1, m - 1] - y * Vs[m - 1, m - 1])
-        Vs[m, m] = f * (x * Vs[m - 1, m - 1] + y * Vc[m - 1, m - 1])
-    for m in range(0, n_max):  # first subdiagonal
-        f = math.sqrt(2 * m + 3)
-        Vc[m + 1, m] = f * z * Vc[m, m]
-        Vs[m + 1, m] = f * z * Vs[m, m]
-    for m in range(0, n_max + 1):  # vertical recursion
-        for n in range(m + 2, n_max + 1):
-            a = math.sqrt((2 * n + 1) * (2 * n - 1) / ((n - m) * (n + m)))
-            b = math.sqrt(
-                (2 * n + 1) * (n + m - 1) * (n - m - 1) / ((2 * n - 3) * (n - m) * (n + m))
-            )
-            Vc[n, m] = a * z * Vc[n - 1, m] - b * r2 * Vc[n - 2, m]
-            Vs[n, m] = a * z * Vs[n - 1, m] - b * r2 * Vs[n - 2, m]
-    return Vc, Vs
-
-
-def _gauss01(n):
-    """n-point Gauss-Legendre nodes and weights on [0, 1]."""
-    x, w = np.polynomial.legendre.leggauss(n)
-    return 0.5 * (x + 1.0), 0.5 * w
-
-
 class Moments:
     """
     Mass integrals of a body, linear in density.
@@ -364,9 +275,9 @@ def polyhedron_moments(V, T, n_max, r_ref, chunk=4000):
     Moments
     """
     deg = max(n_max, 2)
-    t, wt = _gauss01((deg + 4) // 2)  # degree deg + 2 in t
-    s, ws = _gauss01((deg + 3) // 2)  # degree deg + 1 in s
-    q, wq = _gauss01((deg + 2) // 2)  # degree deg in q
+    t, wt = gauss01((deg + 4) // 2)  # degree deg + 2 in t
+    s, ws = gauss01((deg + 3) // 2)  # degree deg + 1 in s
+    q, wq = gauss01((deg + 2) // 2)  # degree deg in q
     TT, SS, QQ = (g.ravel() for g in np.meshgrid(t, s, q, indexing="ij"))
     W = (np.einsum("i,j,k->ijk", wt * t**2, ws * s, wq)).ravel() * 6.0
     c0, c1, c2 = TT * (1.0 - SS), TT * SS * (1.0 - QQ), TT * SS * QQ  # barycentric
@@ -407,7 +318,7 @@ class BallRule:
     """
 
     def __init__(self, n_max):
-        r, wr = _gauss01(n_max // 2 + 3)
+        r, wr = gauss01(n_max // 2 + 3)
         mu, wmu = np.polynomial.legendre.leggauss(n_max // 2 + 2)
         n_phi = n_max + 2
         phi = 2.0 * np.pi * np.arange(n_phi) / n_phi
@@ -802,27 +713,6 @@ def plot_inertia_marginals(D_post, D_prior, d_true, d_hom, name="fig_inertia_mar
     return MCMCPlots.save_figure(fig, name)
 
 
-def _mesh_section(V, T, axis):
-    """Segments (n, 2, 2) of the outer-surface cut by the plane x_axis = 0, in the other two axes."""
-    keep = [k for k in range(3) if k != axis]
-    d = V[T][:, :, axis]  # (n_t, 3) signed distances
-    segs = []
-    for i, j in ((0, 1), (1, 2), (2, 0)):
-        cross = (d[:, i] >= 0.0) != (d[:, j] >= 0.0)  # vertices on the plane count as above
-        a, b = V[T[cross, i]], V[T[cross, j]]
-        lam = (d[cross, i] / (d[cross, i] - d[cross, j]))[:, None]
-        segs.append((np.flatnonzero(cross), a + lam * (b - a)))
-    # pair the two crossing points of each cut triangle
-    idx = np.concatenate([s[0] for s in segs])
-    pts = np.concatenate([s[1] for s in segs])
-    order = np.argsort(idx, kind="stable")
-    idx, pts = idx[order], pts[order]
-    first = np.flatnonzero(np.r_[True, idx[1:] != idx[:-1]])
-    ok = (first + 1 < len(idx)) & (idx[np.minimum(first + 1, len(idx) - 1)] == idx[first])
-    first = first[ok]
-    return np.stack([pts[first][:, keep], pts[first + 1][:, keep]], axis=1)
-
-
 def plot_core_sections(V, T, post, truth, com_post, com_true, name="fig_core_sections", n_draw=80):
     """Cuts of the outer shape through the origin with the core: truth and posterior draws."""
     from matplotlib.collections import LineCollection
@@ -833,7 +723,7 @@ def plot_core_sections(V, T, post, truth, com_post, com_true, name="fig_core_sec
     axes_names = ["x", "y", "z"]
     for ax, cut in zip(axs, (2, 1, 0)):  # planes z = 0, y = 0, x = 0
         i, j = [k for k in range(3) if k != cut]
-        ax.add_collection(LineCollection(_mesh_section(V, T, cut), colors="0.35", lw=0.6))
+        ax.add_collection(LineCollection(mesh_section(V, T, cut), colors="0.35", lw=0.6))
 
         def ellipse(th, **kw):
             s = 1.0 - (th[5 + cut] / th[2 + cut]) ** 2
@@ -893,10 +783,6 @@ def plot_residuals(model, post, theta_hom, name="fig_residuals", n_draw=300):
     return MCMCPlots.save_figure(fig, name)
 
 
-def _fmt(x):
-    return f"{x:12.6g}"
-
-
 def write_summary(path, D_post, D_prior, d_true, d_hom, theta_post, extra_lines):
     """Text table of the parameters and the derived inertia quantities."""
     lines = list(extra_lines) + [""]
@@ -906,13 +792,13 @@ def write_summary(path, D_post, D_prior, d_true, d_hom, theta_post, extra_lines)
     for k, nm in enumerate(DERIVED_NAMES):
         q16, q50, q84 = np.percentile(D_post[:, k], [16, 50, 84])
         p16, p84 = np.percentile(D_prior[:, k], [16, 84])
-        lines.append(f"{nm:>14s} {_fmt(d_true[k])} {_fmt(d_hom[k])} {_fmt(q50)} "
-                     f"{_fmt(q50 - q16)} {_fmt(q84 - q50)} {_fmt(p16)} {_fmt(p84)}")
+        lines.append(f"{nm:>14s} {fmt(d_true[k])} {fmt(d_hom[k])} {fmt(q50)} "
+                     f"{fmt(q50 - q16)} {fmt(q84 - q50)} {fmt(p16)} {fmt(p84)}")
     lines += ["", "Parameters", f"{'parameter':>14s} {'truth':>12s} {'median':>12s} "
               f"{'-1sig':>12s} {'+1sig':>12s}"]
     for k, nm in enumerate(PAR_NAMES):
         q16, q50, q84 = np.percentile(theta_post[:, k], [16, 50, 84])
-        lines.append(f"{nm:>14s} {_fmt(TRUTH[k])} {_fmt(q50)} {_fmt(q50 - q16)} {_fmt(q84 - q50)}")
+        lines.append(f"{nm:>14s} {fmt(TRUTH[k])} {fmt(q50)} {fmt(q50 - q16)} {fmt(q84 - q50)}")
     text = "\n".join(lines) + "\n"
     print(text)
     MCMCPlots.write_output(path, text.encode(), tag="Summary")

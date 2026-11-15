@@ -2,9 +2,9 @@ r"""
 Interior density of an asteroid from its spherical-harmonic gravity field, by density
 regions (or mascons) and MCMC (emcee).
 
-Standalone: no orbit propagation, no MCMCModel. The figures reuse the house style of
-MCMCPlots.py (configure, plot_corner, save_figure, write_output) and the solid harmonics
-of get_interior_inertia.py.
+No orbit propagation, no MCMCModel. The OBJ loader, solid harmonics, Gauss rules and mesh
+cuts come from Interior.py; the figures reuse the house style of MCMCPlots.py (configure,
+plot_corner, save_figure, write_output).
 
 Model
 -----
@@ -77,7 +77,7 @@ from scipy.optimize import least_squares
 from scipy.stats import uniform
 
 import MCMCPlots
-from get_interior_inertia import _gauss01, solid_harmonics
+from Interior import fmt, gauss01, load_shape, mesh_section, solid_harmonics
 
 MCMCPlots.SHOW_FIGS = True  # plt.show() after each figure is saved
 
@@ -145,70 +145,8 @@ STRATEGIC_SYM = [r"\mathrm{c}", r"+a", r"-a", r"+b", r"-b", r"+c", r"-c"]
 
 
 # ============================================================
-# OBJ loading / triangulation (minimal)
+# Mesh volume
 # ============================================================
-
-
-def load_obj(filepath: str) -> Tuple[np.ndarray, List[List[int]]]:
-    """
-    Read the vertices and polygon faces of a Wavefront OBJ.
-
-    Parameters
-    ----------
-    filepath : str or Path
-        OBJ file ('v' and 'f' records; texture/normal indices and negative indices handled).
-
-    Returns
-    -------
-    V : ndarray, shape (n_v, 3)
-        Vertices, in the OBJ length unit.
-    faces : list of list of int
-        Zero-based vertex indices of each polygon (3 or more vertices).
-    """
-    verts = []
-    faces = []
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("v "):
-                parts = line.split()
-                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
-            elif line.startswith("f "):
-                parts = line.split()[1:]
-                idx = []
-                for p in parts:
-                    v_str = p.split("/")[0]
-                    vi = int(v_str)
-                    if vi < 0:
-                        vi = len(verts) + vi + 1
-                    idx.append(vi - 1)
-                if len(idx) >= 3:
-                    faces.append(idx)
-    return np.asarray(verts, dtype=float), faces
-
-
-def triangulate_faces(faces: List[List[int]]) -> np.ndarray:
-    """
-    Fan-triangulate polygon faces.
-
-    Parameters
-    ----------
-    faces : list of list of int
-        Vertex indices of each polygon.
-
-    Returns
-    -------
-    ndarray of int, shape (n_t, 3)
-        Triangles.
-    """
-    tris = []
-    for face in faces:
-        a = face[0]
-        for i in range(1, len(face) - 1):
-            tris.append([a, face[i], face[i + 1]])
-    return np.asarray(tris, dtype=int)
 
 
 def signed_volume_of_mesh(V: np.ndarray, T: np.ndarray) -> float:
@@ -229,49 +167,6 @@ def signed_volume_of_mesh(V: np.ndarray, T: np.ndarray) -> float:
     v1 = V[T[:, 1]]
     v2 = V[T[:, 2]]
     return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
-
-
-def enforce_outward_orientation(V: np.ndarray, T: np.ndarray) -> np.ndarray:
-    """
-    Flip every triangle if the mesh is inward oriented (negative signed volume).
-
-    Parameters
-    ----------
-    V : ndarray, shape (n_v, 3)
-    T : ndarray of int, shape (n_t, 3)
-
-    Returns
-    -------
-    ndarray of int, shape (n_t, 3)
-        Outward-oriented triangles.
-    """
-    if signed_volume_of_mesh(V, T) < 0.0:
-        return T[:, [0, 2, 1]]
-    return T
-
-
-def load_shape(path, unit=1.0):
-    """
-    Read a Wavefront OBJ as a closed, outward-oriented triangle mesh in metres.
-
-    Parameters
-    ----------
-    path : str or Path
-        OBJ file.
-    unit : float
-        Factor from the OBJ length unit to metres.
-
-    Returns
-    -------
-    V : ndarray, shape (n_v, 3)
-        Vertices [m].
-    T : ndarray of int, shape (n_t, 3)
-        Outward-oriented triangles.
-    """
-    V, faces = load_obj(path)
-    V = V * unit
-    T = enforce_outward_orientation(V, triangulate_faces(faces))
-    return V, T
 
 
 # ============================================================
@@ -1101,9 +996,9 @@ def region_design_matrix(V, T, n_deg, r_ref, r_core, belt_lat_deg, chunk=8000):
     K = 7
     A = np.zeros((2 * len(nm), K))
     volumes = np.zeros(K)
-    s, ws = _gauss01((n_deg + 3) // 2)
-    q, wq = _gauss01((n_deg + 2) // 2)
-    u, wu = _gauss01((n_deg + 4) // 2)
+    s, ws = gauss01((n_deg + 3) // 2)
+    q, wq = gauss01((n_deg + 2) // 2)
+    u, wu = gauss01((n_deg + 4) // 2)
     SS, QQ = (g.ravel() for g in np.meshgrid(s, q, indexing="ij"))
     W_sq = 6.0 * np.outer(ws * s, wq).ravel()
     c0, c1, c2 = 1.0 - SS, SS * (1.0 - QQ), SS * QQ
@@ -1511,41 +1406,6 @@ def plot_densities(post, rho_lsq, cov_lsq, rho_bulk, lo, hi, name="fig_densities
     return MCMCPlots.save_figure(fig, name)
 
 
-def _mesh_section(V, T, axis):
-    """
-    Cut of the surface mesh by the plane x_axis = 0.
-
-    Parameters
-    ----------
-    V : ndarray, shape (n_v, 3)
-    T : ndarray of int, shape (n_t, 3)
-    axis : int
-        Normal of the cutting plane (0, 1, 2).
-
-    Returns
-    -------
-    ndarray, shape (n, 2, 2)
-        Segments, in the two other coordinates.
-    """
-    keep = [k for k in range(3) if k != axis]
-    d = V[T][:, :, axis]  # (n_t, 3) signed distances
-    segs = []
-    for i, j in ((0, 1), (1, 2), (2, 0)):
-        cross = (d[:, i] >= 0.0) != (d[:, j] >= 0.0)  # vertices on the plane count as above
-        a, b = V[T[cross, i]], V[T[cross, j]]
-        lam = (d[cross, i] / (d[cross, i] - d[cross, j]))[:, None]
-        segs.append((np.flatnonzero(cross), a + lam * (b - a)))
-    # pair the two crossing points of each cut triangle
-    idx = np.concatenate([s[0] for s in segs])
-    pts = np.concatenate([s[1] for s in segs])
-    order = np.argsort(idx, kind="stable")
-    idx, pts = idx[order], pts[order]
-    first = np.flatnonzero(np.r_[True, idx[1:] != idx[:-1]])
-    ok = (first + 1 < len(idx)) & (idx[np.minimum(first + 1, len(idx) - 1)] == idx[first])
-    first = first[ok]
-    return np.stack([pts[first][:, keep], pts[first + 1][:, keep]], axis=1)
-
-
 def plot_density_sections(V, T, pos, layers, rho_med, com, name="fig_density_sections",
                           slab=0.15):
     """
@@ -1588,7 +1448,7 @@ def plot_density_sections(V, T, pos, layers, rho_med, com, name="fig_density_sec
     axes_names = ["x", "y", "z"]
     for ax, cut in zip(axs, (2, 1, 0)):  # planes z = 0, y = 0, x = 0
         i, j = [k for k in range(3) if k != cut]
-        ax.add_collection(LineCollection(_mesh_section(V, T, cut), colors="0.35", lw=0.6))
+        ax.add_collection(LineCollection(mesh_section(V, T, cut), colors="0.35", lw=0.6))
         sel = np.ones(len(pos), bool) if few else np.abs(pos[:, cut]) < slab * r_max
         order = np.argsort(pos[sel, cut]) if few else slice(None)  # nearer mascons on top
         P, D = pos[sel][order], dens[sel][order]
@@ -1639,7 +1499,7 @@ def _plane_section(V, T, e1, e2):
     """
     nrm = np.cross(e1, e2)
     R = np.array([e1, e2, nrm])  # rows: new axes; the plane is the new z = 0
-    return _mesh_section(V @ R.T, T, 2)
+    return mesh_section(V @ R.T, T, 2)
 
 
 def _inside_mask(segs, u, v):
@@ -1809,11 +1669,6 @@ def plot_residuals(post_model, post, rho_lsq, rho_hom, names, name="fig_residual
     return MCMCPlots.save_figure(fig, name)
 
 
-def _fmt(x):
-    """Fixed-width number for the summary table."""
-    return f"{x:12.6g}"
-
-
 def write_summary(path, post, rho_lsq, cov_lsq, rho_hom, par_names, extra_lines):
     """
     Text table of the densities: posterior median and 16-84 % half-widths, least squares,
@@ -1838,8 +1693,8 @@ def write_summary(path, post, rho_lsq, cov_lsq, rho_hom, par_names, extra_lines)
                                  f"{'LSQ':>12s} {'LSQ 1sig':>12s} {'homogeneous':>12s}"]
     for k, nm in enumerate(par_names):
         q16, q50, q84 = np.percentile(post[:, k], [16, 50, 84])
-        lines.append(f"{nm:>12s} {_fmt(q50)} {_fmt(q50 - q16)} {_fmt(q84 - q50)} "
-                     f"{_fmt(rho_lsq[k])} {_fmt(sig[k])} {_fmt(rho_hom[k])}")
+        lines.append(f"{nm:>12s} {fmt(q50)} {fmt(q50 - q16)} {fmt(q84 - q50)} "
+                     f"{fmt(rho_lsq[k])} {fmt(sig[k])} {fmt(rho_hom[k])}")
     text = "\n".join(lines) + "\n"
     print(text)
     MCMCPlots.write_output(path, text.encode(), tag="Summary")
