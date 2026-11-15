@@ -36,7 +36,9 @@ Steps (each one compared with the paper in summary.txt)
    sigma_I = C_bar sigma_H / H, and with the paper's 1.8 % for sigma_I = 0.01.
 4. MCMC (b), physical two-layer model: theta = (r2, rho2, w), with the core boundary
    R_c(u) = min(R(u), r2 [(1 - w) + w R(u) / R_v]) blending endmember (A) (w = 0) into
-   endmember (B) (w = 1); data J2, C22 (with a model-error floor) and H.
+   endmember (B) (w = 1); data J2, C22 (with a model-error floor) and H. Sampled in
+   phi = (ln r2, ln(rho2 - rho_mean), w), which straightens the J2/C22 ridge
+   (rho2 - rho_mean) r2^5 ~ const; the Jacobian keeps the prior uniform in theta.
 5. Precession (paper Eq. 1): obliquity, precession period and pole drift rate of the
    homogeneous body from the spin pole and the heliocentric orbit, against Table 3 and the
    1.1 My period; the drift rate scales with H (paper Eq. 12), which sets sigma_H / H.
@@ -553,6 +555,44 @@ class TwoLayerPosterior:
         return np.array([d["I"], d["C"], d["H"], d["J2"], d["rho1"], d["r_c"]])
 
 
+class LogCoreCoordinates:
+    """
+    Sampling coordinates for MCMC (b): phi = (ln r2, ln(rho2 - rho_mean), w).
+
+    J2 and C22 fix the core excess mass moment, roughly (rho2 - rho_mean) r2^5, so in
+    theta the posterior is a thin curved ridge on which affine-invariant moves stall
+    (acceptance ~3 %, stuck walkers). In phi the ridge is close to a straight line.
+    The log-Jacobian r2 (rho2 - rho_mean) keeps the prior uniform in theta, so the
+    posterior is unchanged.
+
+    Parameters
+    ----------
+    post : TwoLayerPosterior
+    rho_mean : float
+    """
+
+    def __init__(self, post, rho_mean=RHO_MEAN):
+        self.post, self.rho_mean = post, rho_mean
+
+    def to_phi(self, theta):
+        theta = np.asarray(theta, dtype=float)
+        excess = np.maximum(theta[..., 1] - self.rho_mean, 1e-9)
+        return np.stack([np.log(theta[..., 0]), np.log(excess), theta[..., 2]], axis=-1)
+
+    def to_theta(self, phi):
+        phi = np.asarray(phi, dtype=float)
+        return np.stack([np.exp(phi[..., 0]), self.rho_mean + np.exp(phi[..., 1]), phi[..., 2]], axis=-1)
+
+    @staticmethod
+    def log_jacobian(phi):
+        """ln |d theta / d phi| = ln r2 + ln(rho2 - rho_mean)."""
+        return phi[..., 0] + phi[..., 1]
+
+    def __call__(self, phi):
+        lp = self.post(self.to_theta(phi))
+        return lp + self.log_jacobian(phi) if np.isfinite(lp) else -np.inf
+
+
 def initialize_walkers(post, n_walkers, rng, chi2_tol=25.0):
     """
     One bounded least-squares fit per walker from a prior draw, then a small Gaussian jitter.
@@ -593,25 +633,39 @@ def initialize_walkers(post, n_walkers, rng, chi2_tol=25.0):
     return np.array(p0), best.x
 
 
-def run_emcee(post, n_steps, rng, label):
+def run_emcee(post, n_steps, rng, label, coords=None):
     """
     emcee with differential-evolution moves (DEMove 0.8, DESnookerMove 0.2).
+
+    Parameters
+    ----------
+    coords : LogCoreCoordinates, optional
+        Sample in these coordinates instead of theta. Walkers start from the theta
+        least-squares fits; the returned chain and log posterior are in theta.
 
     Returns
     -------
     chain : ndarray, shape (n_steps, n_walkers, ndim)
     logp : ndarray, shape (n_steps, n_walkers)
     tau : ndarray, shape (ndim,)
+        Autocorrelation times in the sampled coordinates.
     theta_map : ndarray, shape (ndim,)
     """
     p0, theta_map = initialize_walkers(post, N_WALKERS, rng)
+    target = post if coords is None else coords
+    if coords is not None:
+        p0 = coords.to_phi(p0)
     moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
-    sampler = emcee.EnsembleSampler(N_WALKERS, p0.shape[1], post, moves=moves)
+    sampler = emcee.EnsembleSampler(N_WALKERS, p0.shape[1], target, moves=moves)
     sampler.run_mcmc(p0, n_steps, progress=False)
     tau = sampler.get_autocorr_time(tol=0)
     print(f"[MCMC] {label}: acceptance {np.mean(sampler.acceptance_fraction):.3f}, "
           f"tau max {np.max(tau):.1f} ({n_steps / np.max(tau):.0f} tau)")
-    return sampler.get_chain(), sampler.get_log_prob(), tau, theta_map
+    chain, logp = sampler.get_chain(), sampler.get_log_prob()
+    if coords is not None:
+        logp = logp - coords.log_jacobian(chain)
+        chain = coords.to_theta(chain)
+    return chain, logp, tau, theta_map
 
 
 def flat_posterior(chain, tau):
@@ -900,7 +954,8 @@ if __name__ == "__main__":
                                       f"(a) sigma_H/H = {'none' if s is None else f'{100 * s:.1f} %'}")
             chains_A.append(ch.astype(np.float32))
             taus_A.append(tau)
-        chain_B, logp_B, tau_B, map_B = run_emcee(post_B_model, N_STEPS_B, rng, "(b) two-layer")
+        chain_B, logp_B, tau_B, map_B = run_emcee(post_B_model, N_STEPS_B, rng, "(b) two-layer",
+                                                   coords=LogCoreCoordinates(post_B_model))
         buf = io.BytesIO()
         np.savez_compressed(
             buf, chains_A=np.array(chains_A, dtype=object), taus_A=np.array(taus_A, dtype=object),
@@ -1023,7 +1078,8 @@ if __name__ == "__main__":
         f"{PRIOR_B_LO.tolist()} - {PRIOR_B_HI.tolist()}, rho1 >= {RHO1_MIN:.0f}",
         f"   data J2, C22 (sigma {100 * sig_B['J2'] / d_true['J2']:.3f} %, model floor "
         f"{100 * SIGMA_MODEL_REL:.2f} %), H (sigma {100 * SIGMA_H_REL:.1f} %); {N_WALKERS} walkers x "
-        f"{chain_B.shape[0]} steps, burn-in {burn_B}, thin {thin_B}, tau max {np.max(tau_B):.1f}",
+        f"{chain_B.shape[0]} steps in (ln r2, ln(rho2 - rho_mean), w), burn-in {burn_B}, thin {thin_B}, "
+        f"tau max {np.max(tau_B):.1f}",
         f"  {'':<10s} {'truth':>12s} {'posterior (16-50-84 %)':>34s} {'prior (16-50-84 %)':>34s}",
     ]
     for i, n in enumerate(["r2", "rho2", "w"]):
