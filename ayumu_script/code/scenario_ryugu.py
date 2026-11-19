@@ -611,8 +611,8 @@ if __name__ == "__main__":
     # 261110: 観測の終わりは固定の時刻ではなく、真値の粒子が FOV から出る時刻 T で決める。
     # 観測は 0〜T を n_obs 等分した時刻（n_obs = 4 なら 0, T/3, 2T/3, T。3 なら 0, T/2, T）。ボアサイトは時刻 0 の射出地点に
     # 向けて固定。元は utc1 = 03:00 まで 37 枚（5 分おき）。
-    # n_obs = 4（本人判断 261110。3 回では観測量 6 < 推定変数 7 になるため）
-    n_obs = 4
+    # n_obs = 100（本人判断 261118）
+    n_obs = 100
     fov_t_max = 3600.0  # s, FOV から出る時刻を探す上限（出なければエラー）
     fov_dt = 1.0  # s, FOV から出る時刻を探す刻み
 
@@ -688,12 +688,12 @@ if __name__ == "__main__":
 
     # priors (on deltas about the reference)
     # 261110: 位置: 1σ を小天体の直径（320 m、SHAPE_SCALE の元の値）にして全成分に入れた
-    sig_prior_r = np.full(3, 0.320) * 100  # km
+    sig_prior_r = np.full(3, 0.320)  # km
     # 261110: 速度: 方向は不明（楠本さんに確認、Notion 津田先生研究相談260224 の 3/12）なので、大きさ 0.5 m/s・方向一様の分布の各成分の標準偏差 0.5/sqrt(3) m/s を
     #   全成分に（ノルムのばらつき 1σ 0.05 m/s は方向の幅に比べ小さいので入れない。半球の仮定も入らない）。
     #   MCMC_UNIFORM_SPEED_PRIOR = True のときは、このガウスを使うのはバッチ（Stage 1）だけで、
     #   MCMC は「射出速さが一様」の事前分布に置き換える（下の MCMC 節）。False なら MCMC もこのガウス
-    sig_prior_v = np.full(3, 5.0e-4 / np.sqrt(3.0)) * 100  # km/s (~0.29 m/s)
+    sig_prior_v = np.full(3, 5.0e-4 / np.sqrt(3.0))  # km/s (~0.29 m/s)
     # 本来は奥行き（視線方向）と水平方向で σ が違うので、視線方向に回転させた事前分布にする必要がある（log.md「次」）
     sig_prior_eta = 0.10  # 10% on SRP scale
     prior_looseness = 1
@@ -705,9 +705,43 @@ if __name__ == "__main__":
     burn_in = 2000
     thin = 100
     spherical_spread = 1e-1
-    # Saved chain: every run writes chain.npz into its results folder. Set LOAD_CHAIN to
-    # such a file to skip the sampling and redo the diagnostics and figures from it.
-    LOAD_CHAIN = HERE / "results/scenario_ryugu_261117115946/chain.npz"  # e.g. HERE / "results/<YYMMDDHHMMSS>/chain.npz"
+    # Saved chain: every run writes chain.npz into its results folder. By default a new chain
+    # is sampled. 261118: the saved chain to redraw from is a command-line option (it used to
+    # be a module constant, and a temporary value left in the file made a later run try to
+    # load a deleted chain). Pass --load-chain <results/.../chain.npz> to skip the sampling
+    # and redo the diagnostics and figures from that file; the other settings in this file
+    # must match the run that wrote it (compare with its code/ snapshot).
+    import argparse
+
+    _cli = argparse.ArgumentParser(description="Ryugu particle MCMC scenario")
+    _cli.add_argument(
+        "--load-chain",
+        type=Path,
+        default=None,
+        help="saved chain.npz to redraw from (no sampling); default: sample a new chain",
+    )
+    # 261119: the number of images and the prior width are command-line options too, so that
+    # the cases (n_obs 4 / 100, prior x1 / x100) run without editing this file, and the
+    # results folder name carries them (_nobs<N>_priorx<S>).
+    _cli.add_argument(
+        "--n-obs",
+        type=int,
+        default=None,
+        help=f"number of images (default: n_obs in this file, {n_obs})",
+    )
+    _cli.add_argument(
+        "--prior-scale",
+        type=float,
+        default=1.0,
+        help="factor on the position and velocity prior sigmas (eta unchanged); default 1",
+    )
+    _args = _cli.parse_args()
+    LOAD_CHAIN = _args.load_chain
+    if _args.n_obs is not None:
+        n_obs = _args.n_obs
+    PRIOR_SCALE = _args.prior_scale
+    sig_prior_r = sig_prior_r * PRIOR_SCALE
+    sig_prior_v = sig_prior_v * PRIOR_SCALE
     # Also save fig_corner_rtn: the corner plot with the position and velocity deviations in
     # the RTN frame (radial, along-track, orbit normal) of the batch solution ref1 about the
     # central body (MCMCPlots.rtn_corner_map).
@@ -761,6 +795,9 @@ if __name__ == "__main__":
         / "results"
         / (
             Path(__file__).stem
+            # 261119: the case, before the stamp (the redraw suffix below reads the stamp as
+            # the last "_" field of the source folder)
+            + f"_nobs{n_obs}_priorx{PRIOR_SCALE:g}"
             + "_"
             + datetime.now().strftime("%y%m%d%H%M%S")
             + ("_scaledGN" if SCALED_BATCH else "")
